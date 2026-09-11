@@ -22,3 +22,21 @@ it is a feature. If you are unsure whether a change is a fix or a feature, ask r
    which function changed.
 3. Run `node test/interceptor.test.js` and `node test/changelog.test.js`. The changelog test
    fails if the top entry does not match the manifest version.
+4. Always pack the extension into a zip for the new version, without waiting to be asked. Eric
+   tests each release by loading the zip himself. The zip goes in `~/Downloads`, is named
+   `RealView-extension-<version>.zip`, and holds one top-level folder called `RealView-extension`
+   with the contents of `src/`, which is the layout the README's setup steps expect. Remove any
+   older RealView zip you created earlier in the same session so only the current one is left.
+
+   ```sh
+   VERSION=$(node -p "require('./src/manifest.json').version")
+   STAGE=$(mktemp -d)
+   mkdir "$STAGE/RealView-extension"
+   cp -R src/. "$STAGE/RealView-extension/"
+   (cd "$STAGE" && zip -qr ~/Downloads/RealView-extension-$VERSION.zip RealView-extension -x '*.DS_Store')
+   rm -rf "$STAGE"
+   unzip -l ~/Downloads/RealView-extension-$VERSION.zip
+   ```
+
+   Check that the listing shows `manifest.json` at the new version before reporting the release
+   as done.
