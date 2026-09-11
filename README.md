@@ -99,6 +99,19 @@ On the channel this was built against the difference is real: over 365 days the 
   Videos that tie share a place, as Studio does it. If any video in the list cannot be dated, the
   ranking is left exactly as the server sent it rather than half rebuilt.
 
+  That span is the newest video's age to the minute, and each video is counted hour by hour over
+  it rather than as one total. The hour a video's window ends inside is worth the minutes of it
+  that video has lived through — the same arithmetic the charts use — so all ten figures move as
+  the hour passes rather than standing still and then jumping together when it turns over. The
+  newest video's window ends at this moment, so the hour it is living through counts for
+  everything it holds. Past a fortnight the hours become too many to ask for ten times over and
+  the whole-hour total stands instead. A video the server will not break down by hour is asked
+  for again as a single total, which costs that one video its hour-by-hour detail and nothing
+  else: the total covers the window rounded out to whole hours, so it is scaled back to the span
+  the others were counted over, as if the views had fallen evenly across it. Publish times never
+  change, so the video list is only fetched once and every later card is dated from what is
+  already known.
+
   The card beside the ranking also carries the server's judgement of the same figures: a typical
   band and an arrow saying whether this video sits above it, inside it or below it. Both were made
   from raw views, so once the ranking is engaged they are redone from the same engaged figures —
@@ -186,6 +199,31 @@ malfunction, so it does not count towards standing the extension down.
 An answer with no rows in it is not a failure either: it means there were no engaged views in
 that window, so the table reads zero rather than staying raw.
 
+### A query that fails is not the last word
+
+A query that fails no longer costs its figures outright, and no longer costs them again for the
+next minute — a failure used to be cached exactly like an answer, so every request for a minute
+afterwards was handed the refusal without anyone asking again. Only answers are remembered now.
+
+A question that cannot be answered is answered from the last figures it really got, for up to
+fifteen minutes. A stale engaged view is still an engaged view, so a card built from one is still
+telling the truth about which metric it is showing; and since the caller simply gets a table, every
+surface benefits alike — screens, cards, the dashboard, the video list. Past fifteen minutes the
+query answers with nothing, the figures stay raw and the wording says raw, exactly as it would have
+before. The latest-video ranking is remembered the same way, but as a whole: the order, the places
+that tie and the typical band beside it all come out of one list of figures, so the card is put
+back together from that list rather than mixing remembered figures with fresh ones. Its own
+queries are deliberately left out of the memory kept per question, which they would otherwise
+hit — a ranking's windows are rounded out to whole hours, so the same ten questions are asked all
+through an hour — because one video answered from ten minutes ago beside nine answered from this
+minute is a list that describes no moment at all.
+
+Meanwhile the query is asked again in the background — five seconds after it failed, then fifteen,
+then sixty, and then it is left alone. Those retries never touch the page and never answer anybody:
+whoever asked has already had its answer, raw or remembered. They exist so that the next time
+Studio asks the same question, the answer is already waiting. A retry that fails is not counted as
+a fault, since nothing was waiting on it.
+
 ### The typical range
 
 Studio compares a figure against a band it calls typical, and the server only models that band
@@ -231,8 +269,9 @@ looked at costs nothing at all.
 Renaming a metric without replacing the numbers is easy, and produces a Studio that claims to
 show engaged views while displaying raw ones. RealView never does this:
 
-- Any query that fails, or does not answer within four seconds, is abandoned and the original
-  response is passed through untouched. A screen can never be left waiting on this extension.
+- Any query that fails, or does not answer in time, is abandoned: its figures fall back on the last
+  ones that question really got, and on the raw response once those are a quarter of an hour old.
+  A screen can never be left waiting on this extension.
 - A card is only renamed when its figures were really replaced.
 - The daily chart is dropped rather than left drawn from raw views under an engaged label.
 - The "views are counted differently now" notice is removed from converted cards, since it
@@ -254,6 +293,11 @@ that could go wrong is closed off:
   exchange. A screen cannot end up waiting on this extension.
 - After two faults of the extension's own making, it stands down for the rest of the page and
   Studio serves its own figures. A systematic problem costs the engaged numbers, never the page.
+- Standing down means sending nothing of its own: no queries, no retries, not even a video lookup.
+  A batch already in flight when the limit is reached is not split up and sent again a query at a
+  time either; whatever it came back missing simply goes unanswered. Figures already remembered
+  are still substituted, since that costs no request, and everything else is left raw and
+  labelled raw.
 
 ## Red charts
 
@@ -300,9 +344,10 @@ packaged folder.
 `test/harness.js` stands up a miniature Studio — a scripted `XMLHttpRequest`, a document element
 carrying the settings, an event target — and loads `src/interceptor.js` into it unmodified. The
 suite covers each conversion technique, the parallel query, the cache, the four-second deadline,
-a failing query, an error from Studio, the disabled state, the exact event sequence a rewritten
-response is delivered with, an exception inside the extension, and the fault limit standing the
-extension down.
+a failing query, the figures one is answered from and the quarter of an hour they last, the retries
+behind it, an error from Studio, the disabled state, the exact event sequence a rewritten response
+is delivered with, an exception inside the extension, and the fault limit standing the extension
+down — still serving what it remembers and asking for nothing.
 
 ## License
 

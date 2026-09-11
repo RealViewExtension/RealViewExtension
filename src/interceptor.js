@@ -63,6 +63,12 @@
   // figures rather than the screen.
   var FAULT_LIMIT = 2;
   var CACHE_TTL_MS = 60000;
+  // How long the last answer a question really got goes on being served once a
+  // later one fails. Past this the query answers with nothing and its surface
+  // falls back to the raw figures, labelled as raw.
+  var LAST_GOOD_TTL_MS = 15 * 60 * 1000;
+  // When a failed query is asked again, measured from each failure in turn.
+  var RETRY_DELAYS_MS = [5000, 15000, 60000];
 
   // Native handles are taken at document_start, before Studio's own code runs,
   // so the proxy can issue real requests without re-entering its own patch.
@@ -234,7 +240,10 @@
   function fault(reason) {
     faults++;
     log('fault', faults, 'of', FAULT_LIMIT, '-', reason);
-    if (faults >= FAULT_LIMIT) log('standing down for the rest of this page; Studio will serve its own figures');
+    if (faults >= FAULT_LIMIT) {
+      log('standing down for the rest of this page; Studio will serve its own figures');
+      cancelRetries();
+    }
   }
 
   function standingDown() {
@@ -254,9 +263,103 @@
     return hit.promise;
   }
 
+  // Setting a key it already holds leaves that key where it first went in, so
+  // the question asked most often would be the first one evicted. It is dropped
+  // and put back instead, which moves it to the end of the queue.
   function cacheSet(key, promise) {
+    cache.delete(key);
     cache.set(key, { at: Date.now(), promise: promise });
     if (cache.size > 200) cache.delete(cache.keys().next().value);
+  }
+
+  // A failure must not be remembered as an answer. The entry holds a promise
+  // that resolved to nothing, so every request for the next minute would be
+  // handed that refusal without anyone asking the server again. It is dropped
+  // instead, and only if it is still the same attempt that failed.
+  function cacheDrop(key, promise) {
+    var hit = cache.get(key);
+    if (hit && hit.promise === promise) cache.delete(key);
+  }
+
+  // The figures each question was last really answered with. A query that
+  // fails is answered from these rather than leaving its surface raw: a stale
+  // engaged figure is still an engaged figure, and a quarter of an hour of one
+  // is better than a card quietly going back to counting views the new way.
+  var lastGood = new Map();
+
+  function lastGoodSet(key, table) {
+    lastGood.delete(key);
+    lastGood.set(key, { at: Date.now(), table: table });
+    if (lastGood.size > 200) lastGood.delete(lastGood.keys().next().value);
+  }
+
+  function lastGoodGet(key) {
+    var hit = lastGood.get(key);
+    if (!hit) return null;
+    if (Date.now() - hit.at > LAST_GOOD_TTL_MS) { lastGood.delete(key); return null; }
+    return hit;
+  }
+
+  // Ages are logged the way a person would say them.
+  function describeAge(ms) {
+    var seconds = Math.round(ms / 1000);
+    return seconds < 90 ? seconds + 's' : Math.round(seconds / 60) + 'min';
+  }
+
+  // A query that came to nothing is asked again in the background, so the
+  // answer is waiting the next time Studio asks the same thing rather than
+  // being fetched while a screen waits on it. A retry never touches the page
+  // and never answers anybody: whoever asked has already had its answer.
+  var retries = new Map();
+  // A page that keeps failing different questions must not end up holding a
+  // timer for every one of them. Past this many chains the newest question
+  // simply goes without one; the chains already running finish as they are.
+  var RETRY_CHAIN_LIMIT = 50;
+  var retryCapReported = false;
+
+  function cancelRetry(key) {
+    var chain = retries.get(key);
+    if (!chain) return;
+    clearTimeout(chain.timer);
+    retries.delete(key);
+  }
+
+  function cancelRetries() {
+    retries.forEach(function (chain) { clearTimeout(chain.timer); });
+    retries.clear();
+  }
+
+  function scheduleRetry(ctx, node, attempt) {
+    var key = cacheKey(node);
+    // Standing down means sending nothing at all, in the background as much as
+    // in front of a waiting screen.
+    if (standingDown()) { cancelRetry(key); return; }
+    // Three goes and then the question is left alone until something asks it.
+    if (attempt >= RETRY_DELAYS_MS.length) { retries.delete(key); return; }
+    // One chain per question: a second failure of the same query joins the one
+    // already running rather than starting a competing one.
+    if (attempt === 0 && retries.has(key)) return;
+    if (attempt === 0 && retries.size >= RETRY_CHAIN_LIMIT) {
+      if (!retryCapReported) {
+        retryCapReported = true;
+        log('already retrying', retries.size, 'questions; further ones are left alone');
+      }
+      return;
+    }
+
+    var timer = setTimeout(function () {
+      retries.delete(key);
+      // A minute is long enough for the page to have changed its mind: the
+      // popup may have turned the extension off, or a fault may have stood it
+      // down, since this was scheduled. Either way nothing is sent.
+      if (!enabled() || standingDown()) return;
+      // Asked quietly: nobody is waiting on the answer, so failing again must
+      // not count towards standing the extension down.
+      runQueries(ctx, [node], { quiet: true, attempt: attempt }).catch(function () {});
+    }, RETRY_DELAYS_MS[attempt]);
+
+    cancelRetry(key);
+    retries.set(key, { timer: timer });
   }
 
   function parseResultTable(node) {
@@ -282,25 +385,61 @@
   // asked for twice - by the guess made ahead of a screen and again by the
   // screen itself - is therefore only ever sent once, and a guess that turns
   // out not to match simply goes unused.
-  function runQueries(ctx, nodes) {
+  function runQueries(ctx, nodes, options) {
+    options = options || {};
     var pending = [];
     var waits = [];
 
+    // Answers one question: from the batch if it can, and from the figures the
+    // same question was last really answered with if it cannot. The caller
+    // cannot tell the two apart - it is handed a table either way - so every
+    // surface gets the fallback for nothing. A caller that remembers its own
+    // answers whole - the ranking - asks for none of this: it wants a plain
+    // no rather than one stale table among nine fresh ones.
+    function settle(node, key, promise, fresh) {
+      return promise.then(function (table) {
+        if (table) {
+          if (fresh && !options.noFallback) lastGoodSet(key, table);
+          return { key: node.key, table: table };
+        }
+        cacheDrop(key, promise);
+        if (options.noFallback) return { key: node.key, table: null };
+        var kept = lastGoodGet(key);
+        if (!kept) return { key: node.key, table: null };
+        log('a query failed; answering it with figures from', describeAge(Date.now() - kept.at), 'ago');
+        return { key: node.key, table: kept.table };
+      });
+    }
+
     nodes.forEach(function (node) {
       var key = cacheKey(node);
+      // A request of its own is about to make a real attempt, which is all the
+      // background chain was waiting to do.
+      if (!options.quiet) cancelRetry(key);
       var hit = cacheGet(key);
       if (hit) {
-        waits.push(hit.then(function (table) { return { key: node.key, table: table }; }));
+        waits.push(settle(node, key, hit, false));
         return;
       }
       var resolve;
       var promise = new Promise(function (r) { resolve = r; });
       cacheSet(key, promise);
       pending.push({ node: node, resolve: resolve });
-      waits.push(promise.then(function (table) { return { key: node.key, table: table }; }));
+      waits.push(settle(node, key, promise, true));
     });
 
-    if (pending.length) sendBatch(ctx, pending, 0, Date.now() + queryBudget(pending.length));
+    // Standing down means the extension sends nothing of its own, so the
+    // questions go unasked and are answered from memory or not at all.
+    if (pending.length && standingDown()) {
+      log('standing down: answering', pending.length, 'queries without sending any');
+      pending.forEach(function (item) { item.resolve(null); });
+    } else if (pending.length) {
+      // A caller partway through a budget of its own - the ranking, on its
+      // second round of queries - says how much of it is left rather than
+      // starting a fresh one that would outlast its watchdog.
+      var budget = options.budgetMs === undefined ? queryBudget(pending.length) : options.budgetMs;
+      sendBatch(ctx, pending, 0, Date.now() + budget, options);
+    }
 
     return Promise.all(waits).then(function (answers) {
       var results = {};
@@ -314,7 +453,8 @@
   // A query the server will not accept fails the whole request it travels in,
   // so when a batch comes back with anything missing the stragglers are asked
   // for again one at a time. One unsupported query then costs only itself.
-  function sendBatch(ctx, pending, stage, until) {
+  function sendBatch(ctx, pending, stage, until, options) {
+    options = options || {};
     var settled = false;
     function finish(byKey) {
       if (settled) return;
@@ -326,21 +466,38 @@
 
       if (!missing.length) return;
 
+      // This very batch may have been what stood the extension down. Standing
+      // down means sending nothing of its own, and asking the stragglers again
+      // - together or one at a time - would be a fresh request per query at
+      // exactly the moment it promised to stop. They go unanswered instead,
+      // and nothing is scheduled behind them either.
+      if (standingDown()) {
+        log('standing down: leaving', missing.length, 'queries unanswered rather than asking again');
+        missing.forEach(function (item) { item.resolve(null); });
+        return;
+      }
+
       // First the stragglers go out together, in case the batch simply did not
       // arrive. Only then are they split up, which is what finds the single
       // query the server will not accept.
       var timeLeft = until - Date.now() > 500;
       if (timeLeft && stage === 0 && missing.length < pending.length) {
         log('retrying', missing.length, 'queries together');
-        sendBatch(ctx, missing, 1, until);
+        sendBatch(ctx, missing, 1, until, options);
         return;
       }
       if (timeLeft && stage < 2 && missing.length > 1) {
         log('retrying', missing.length, 'queries on their own');
-        missing.forEach(function (item) { sendBatch(ctx, [item], 2, until); });
+        missing.forEach(function (item) { sendBatch(ctx, [item], 2, until, options); });
         return;
       }
-      missing.forEach(function (item) { item.resolve(null); });
+      missing.forEach(function (item) {
+        item.resolve(null);
+        // Failing is not the end of the matter: the question is asked again in
+        // the background, on its own schedule, so the next load finds it
+        // answered rather than asking from scratch.
+        scheduleRetry(ctx, item.node, options.attempt === undefined ? 0 : options.attempt + 1);
+      });
     }
 
     var remaining = Math.max(500, until - Date.now());
@@ -377,12 +534,14 @@
             if (table) byKey[node.key] = table;
           });
         } catch (e) { log('could not read the query response', e); }
+      } else if (options.quiet) {
+        log('a retried query returned status', xhr.status);
       } else {
         fault('query returned status ' + xhr.status);
       }
       finish(byKey);
     };
-    xhr.onerror = function () { clearTimeout(timer); fault('query failed'); finish(null); };
+    xhr.onerror = function () { clearTimeout(timer); if (!options.quiet) fault('query failed'); finish(null); };
     nativeSend.call(xhr, JSON.stringify(body));
   }
 
@@ -1026,12 +1185,7 @@
       }
       var partial = 0;
       if (spread && index < buckets.length && buckets[index].startMs < upTo) {
-        var bucket = buckets[index];
-        // A bucket still being filled has only run up to this moment, so what
-        // it holds so far is spread over the part of it that has passed.
-        var end = Math.min(bucket.startMs + bucket.spanMs, Math.max(now, bucket.startMs + 1));
-        var fraction = (upTo - bucket.startMs) / (end - bucket.startMs);
-        partial = bucket.value * Math.min(1, Math.max(0, fraction));
+        partial = partOfBucket(buckets[index], upTo, now);
       }
       datums[d].y = cumulative ? running + partial : latest;
     }
@@ -1039,6 +1193,32 @@
 
   function bucketCountedBy(bucket, upTo, spread) {
     return spread ? bucket.startMs + bucket.spanMs <= upTo : bucket.startMs <= upTo;
+  }
+
+  // How much of a bucket had accrued by a moment inside it. A bucket still
+  // being filled has only run up to this moment, so what it holds so far is
+  // spread over the part of it that has passed rather than over the whole
+  // hour it will eventually cover.
+  function partOfBucket(bucket, upToMs, nowMs) {
+    var end = Math.min(bucket.startMs + bucket.spanMs, Math.max(nowMs, bucket.startMs + 1));
+    var fraction = (upToMs - bucket.startMs) / (end - bucket.startMs);
+    return bucket.value * Math.min(1, Math.max(0, fraction));
+  }
+
+  // Everything a run of buckets had credited by a given moment: every bucket
+  // that had finished by then in full, plus the share of the one still running.
+  // It works the share out with partOfBucket, the same routine the chart's line
+  // uses, and counts the way that line counts when its points are finer than
+  // its buckets - which is the mode a new video's since-published chart draws
+  // in. A figure worked out this way and a point on that line therefore agree.
+  function accruedBy(buckets, upToMs, nowMs) {
+    var total = 0;
+    for (var i = 0; i < buckets.length; i++) {
+      var bucket = buckets[i];
+      if (bucket.startMs + bucket.spanMs <= upToMs) total += bucket.value;
+      else if (bucket.startMs < upToMs) total += partOfBucket(bucket, upToMs, nowMs);
+    }
+    return total;
   }
 
   function pointsFinerThanBuckets(datums, buckets) {
@@ -1276,10 +1456,48 @@
   var VIDEO_LIST_REQUEST_PATH = '/youtubei/v1/creator/list_creator_videos';
   var RANKING_LOOKUP_SIZE = 50;
 
+  // A video's publish time never changes, and the card asks for the same
+  // handful of videos every time it loads, so the answers are kept for the
+  // life of the page rather than fetched again on each one.
+  var publishTimes = new Map();
+  var PUBLISH_CACHE_LIMIT = 500;
+
+  function rememberPublishTimes(times) {
+    Object.keys(times).forEach(function (id) {
+      publishTimes.delete(id);
+      publishTimes.set(id, times[id]);
+      if (publishTimes.size > PUBLISH_CACHE_LIMIT) publishTimes.delete(publishTimes.keys().next().value);
+    });
+  }
+
   // The ranking compares each video over the same stretch of its own life, so
   // every entry needs the moment its video went up. Studio's own video list
   // carries that, asked for with a mask narrow enough to keep the reply small.
   function fetchPublishTimes(ctx, ids) {
+    // Every video already dated means the list has nothing left to tell us, so
+    // the card costs no request at all.
+    var known = {};
+    var complete = true;
+    ids.forEach(function (id) {
+      if (publishTimes.has(id)) known[id] = publishTimes.get(id);
+      else complete = false;
+    });
+    if (complete) return Promise.resolve(known);
+
+    // Standing down means no request of any kind, so a card whose videos the
+    // page has already dated is still rebuilt and any other is left alone.
+    if (standingDown()) return Promise.resolve(null);
+
+    // A video the list did not date stays undated: it is asked for again next
+    // time rather than remembered as missing, since the list may simply not
+    // have reached back far enough yet.
+    function merged(times) {
+      Object.keys(known).forEach(function (id) {
+        if (!(id in times)) times[id] = known[id];
+      });
+      return times;
+    }
+
     if (!ctx.channelId) return Promise.resolve(null);
 
     var body = {
@@ -1308,11 +1526,15 @@
           var parsed = JSON.parse(xhr.responseText);
           var times = {};
           (parsed.videos || []).forEach(function (video) {
-            if (video && video.videoId && video.timePublishedSeconds) {
+            // A video that has not gone up yet reports a publish time of "0".
+            // It has no life to measure, so it is left undated deliberately and
+            // the ranking it appears in is left exactly as the server sent it.
+            if (video && video.videoId && Number(video.timePublishedSeconds) > 0) {
               times[video.videoId] = Number(video.timePublishedSeconds) * 1000;
             }
           });
-          finish(times);
+          rememberPublishTimes(times);
+          finish(merged(times));
         } catch (e) { finish(null); }
       };
       xhr.onerror = function () { clearTimeout(timer); finish(null); };
@@ -1367,26 +1589,136 @@
     });
   }
 
+  // The ranking is remembered whole, under the videos it describes, and its
+  // queries decline the memory kept per question. They would hit it: a
+  // ranking's windows are rounded out to whole hours, so the same ten
+  // questions are asked all through an hour. But the card is one list of
+  // figures - the order, the ties, the band beside it - and answering one
+  // video from ten minutes ago while the other nine came back fresh would mix
+  // the two into a list that describes no moment at all. Worse, that older
+  // table is measured against a window that has since grown, so its last hours
+  // are simply missing. The queries behind them are retried in the background
+  // like any other, and a failed one is no longer cached, so the next time
+  // this card loads it asks again rather than settling for what it has.
+  var lastGoodRankings = new Map();
+
+  function rankingKey(ids) {
+    return ids.slice().sort().join(',');
+  }
+
+  function rememberRanking(ids, figures) {
+    var key = rankingKey(ids);
+    lastGoodRankings.delete(key);
+    lastGoodRankings.set(key, { at: Date.now(), ids: ids.slice(), figures: figures });
+    if (lastGoodRankings.size > 200) lastGoodRankings.delete(lastGoodRankings.keys().next().value);
+  }
+
+  function rememberedRanking(ids) {
+    var key = rankingKey(ids);
+    var kept = lastGoodRankings.get(key);
+    if (!kept) return null;
+    if (Date.now() - kept.at > LAST_GOOD_TTL_MS) { lastGoodRankings.delete(key); return null; }
+    // The key is the video ids, so a list that matches it holds every one of
+    // them - unless two different lists ever collided on it, in which case a
+    // video would take no figure at all. Half a remembered ranking is worse
+    // than none, so the whole thing is dropped.
+    for (var i = 0; i < ids.length; i++) if (kept.ids.indexOf(ids[i]) === -1) return null;
+    // The server may have reordered the list since, so each video takes the
+    // figure remembered for it rather than the one in its old position.
+    return { at: kept.at, figures: ids.map(function (id) { return kept.figures[kept.ids.indexOf(id)]; }) };
+  }
+
   function convertRanking(ranking, holder, ctx) {
     var ids = ranking.entities.map(function (item) { return item.entity.videoId; });
+    // The card can take three rounds - the video list, the hourly queries, and
+    // the totals for anything they refused - and all three sit inside the one
+    // watchdog covering the conversion. Each round is measured from here so
+    // the last of them cannot be what makes the extension fault on its own card.
+    var startedAt = Date.now();
 
     return fetchPublishTimes(ctx, ids).then(function (times) {
-      if (!times) return false;
+      // The whole card is made of one list of figures - the order, the places
+      // that tie, the band beside it - so it is put together from one list
+      // however that list was arrived at.
+      function apply(figures, stale) {
+        // The hour a window ends in is worth the minutes of it a video has
+        // lived through, so a figure can arrive fractional, and Studio prints
+        // these as text beside the card. Rounding before anything is sorted,
+        // numbered or judged keeps the figure shown, the ties and the band all
+        // describing the same numbers.
+        figures = figures.map(function (figure) { return Math.round(figure); });
+
+        ranking.entities.forEach(function (item, index) { item.value.double = figures[index]; });
+        ranking.entities.sort(function (a, b) { return b.value.double - a.value.double; });
+        ranking.entities.forEach(function (item) { item.rank = placeOf(item.value.double, figures); });
+        applySnapshotComparison(holder, ids, figures);
+
+        // Putting remembered figures back must not make them look any newer
+        // than they are, or a card could go on repeating them indefinitely.
+        if (!stale) rememberRanking(ids, figures);
+
+        log(stale ? 'ranking left as it last stood' : 'ranking rebuilt from engaged views', figures);
+        return true;
+      }
+
+      // Everything that can stop the ranking being rebuilt - a publish-time
+      // lookup that failed, a video that cannot be dated, a video no query
+      // would answer for - ends here: the figures the card last really had,
+      // if they are recent enough to still be worth showing.
+      function remembered() {
+        var kept = rememberedRanking(ids);
+        if (!kept) return false;
+        log('ranking could not be rebuilt; using the figures it had', describeAge(Date.now() - kept.at), 'ago');
+        return apply(kept.figures, true);
+      }
+
+      if (!times) return remembered();
 
       // Every video has to be datable, or the list would mix spans and the
       // order would mean nothing.
       var missing = ids.filter(function (id) { return !times[id]; });
-      if (missing.length) { log('ranking left alone,', missing.length, 'videos without a publish time'); return false; }
+      if (missing.length) { log('ranking left alone,', missing.length, 'videos without a publish time'); return remembered(); }
 
       // The list covers the newest video's life so far, measured from each
-      // video's own start. Whole hours, because the hourly figures are only
-      // accepted on hour boundaries.
+      // video's own start - to the minute rather than rounded to the hour, so
+      // every video is measured over exactly the same length of time.
+      var now = Date.now();
       var newest = Math.max.apply(null, ids.map(function (id) { return times[id]; }));
-      var span = Math.ceil((Date.now() - newest) / HOUR_MS) * HOUR_MS;
-      if (span <= 0) return false;
+      var age = now - newest;
+      if (age <= 0) return false;
 
-      var nodes = ids.map(function (id, index) {
+      var ends = ids.map(function (id) { return times[id] + age; });
+
+      // Asking for one total over a window rounded out to whole hours froze
+      // nine of the ten figures: their windows lie wholly in the past, so
+      // nothing about them changed until the rounding grew by an hour and all
+      // nine jumped at once. Hourly buckets instead, with the hour the window
+      // ends inside counted by the minutes of it that the video has lived
+      // through. Every bar then moves as the hour passes.
+      function hourlyNode(id, index) {
+        return {
+          key: 'rv_rank_hours_' + index,
+          value: {
+            query: buildQuery({
+              dimensions: [{ type: 'HOUR' }],
+              range: {
+                kind: 'hours',
+                startMs: Math.floor(times[id] / HOUR_MS) * HOUR_MS,
+                endMs: Math.ceil(ends[index] / HOUR_MS) * HOUR_MS
+              },
+              restricts: ctx.restricts.concat([{ dimension: { type: 'VIDEO' }, inValues: [id] }]),
+              currency: ctx.currency
+            })
+          }
+        };
+      }
+
+      // One total over the window rounded out to whole hours - what the server
+      // will answer for a video it will not break down by hour, and for a
+      // window too long to ask about hour by hour.
+      function totalNode(id, index) {
         var start = Math.floor(times[id] / HOUR_MS) * HOUR_MS;
+        var span = Math.ceil(age / HOUR_MS) * HOUR_MS;
         return {
           key: 'rv_rank_' + index,
           value: {
@@ -1399,29 +1731,91 @@
             })
           }
         };
-      });
+      }
 
-      return runQueries(ctx, nodes).then(function (results) {
-        var figures = ids.map(function (id, index) {
-          var table = results['rv_rank_' + index];
-          if (!table) return null;
-          if (!table.labels) return 0;
-          for (var i = 0; i < table.labels.length; i++) if (String(table.labels[i]) === id) return Number(table.values[i]);
-          return 0;
+      function totalFigure(table, id) {
+        if (!table) return null;
+        if (!table.labels) return 0;
+        for (var i = 0; i < table.labels.length; i++) if (String(table.labels[i]) === id) return Number(table.values[i]);
+        return 0;
+      }
+
+      // The buckets run from the video's own hour, and no views exist before it
+      // went up, so only the hour the window ends in is worth a share. For the
+      // newest video that end is this moment, and the hour it is living through
+      // counts whole.
+      function hourlyFigure(table, endMs) {
+        if (!table) return null;
+        if (!table.labels) return 0;
+        var buckets = [];
+        for (var i = 0; i < table.labels.length; i++) {
+          buckets.push({ startMs: Number(table.labels[i]), spanMs: HOUR_MS, value: Number(table.values[i]) });
+        }
+        return accruedBy(buckets, endMs, now);
+      }
+
+      function unanswered(figures) {
+        var indexes = [];
+        figures.forEach(function (figure, index) { if (figure === null) indexes.push(index); });
+        return indexes;
+      }
+
+      // Beyond a fortnight the hourly buckets become too many to ask for ten
+      // times over, so the whole-hour total stands as it always did.
+      if (age > HOURLY_WINDOW_LIMIT_MS) {
+        return runQueries(ctx, ids.map(totalNode), { noFallback: true }).then(function (results) {
+          var figures = ids.map(function (id, index) { return totalFigure(results['rv_rank_' + index], id); });
+          if (unanswered(figures).length) {
+            log('ranking left alone, some videos had no answer');
+            return remembered();
+          }
+          return apply(figures);
         });
+      }
 
-        if (figures.some(function (figure) { return figure === null; })) {
-          log('ranking left alone, some videos had no answer');
-          return false;
+      return runQueries(ctx, ids.map(hourlyNode), { noFallback: true }).then(function (results) {
+        var figures = ids.map(function (id, index) { return hourlyFigure(results['rv_rank_hours_' + index], ends[index]); });
+
+        // A video the server will not break down by hour costs only its own
+        // precision: it is asked for again as a single total, and only a video
+        // that cannot be answered either way leaves the ranking alone.
+        var refused = unanswered(figures);
+        if (!refused.length) return apply(figures);
+
+        // Two rounds have already gone by, and a third that ran past the
+        // watchdog would have the extension fault on a card it was in the
+        // middle of rebuilding. Whatever is left of that watchdog, less a
+        // moment to put the answer together, is all this round may have; too
+        // little to be worth sending and the card stands on what it remembers.
+        var remaining = WATCHDOG_MS - 2000 - (Date.now() - startedAt);
+        if (remaining < 1000) {
+          log('no time left to ask for', refused.length, 'videos as totals');
+          return remembered();
         }
 
-        ranking.entities.forEach(function (item, index) { item.value.double = figures[index]; });
-        ranking.entities.sort(function (a, b) { return b.value.double - a.value.double; });
-        ranking.entities.forEach(function (item) { item.rank = placeOf(item.value.double, figures); });
-        applySnapshotComparison(holder, ids, figures);
-
-        log('ranking rebuilt from engaged views', figures);
-        return true;
+        log('asking for', refused.length, 'videos as totals instead');
+        var totals = refused.map(function (index) { return totalNode(ids[index], index); });
+        return runQueries(ctx, totals, { noFallback: true, budgetMs: remaining }).then(function (fallback) {
+          refused.forEach(function (index) {
+            var figure = totalFigure(fallback['rv_rank_' + index], ids[index]);
+            // That total covers the window rounded out to whole hours, which is
+            // up to fifty-nine minutes more of this video's life than the other
+            // nine were counted over - and the newest video is being counted to
+            // the minute, so the two are not comparable as they stand. The
+            // total is scaled back to the span they share, which assumes the
+            // views fell evenly across the rounded window. That assumption is
+            // only ever made for a video the server will not break down by
+            // hour, which is the one case where there is nothing better to go
+            // on; a ranking asked for as totals throughout rounds every video
+            // the same way and needs none of it.
+            figures[index] = figure === null ? null : figure * (age / (Math.ceil(age / HOUR_MS) * HOUR_MS));
+          });
+          if (unanswered(figures).length) {
+            log('ranking left alone, some videos had no answer');
+            return remembered();
+          }
+          return apply(figures);
+        });
       });
     }).catch(function (error) {
       log('ranking left alone', error);
@@ -1962,19 +2356,26 @@
   function route(xhr, body, args) {
     var url = xhr.__realViewUrl || '';
 
-    if (!enabled() || standingDown() || typeof body !== 'string') return nativeSend.apply(xhr, args);
+    if (!enabled() || typeof body !== 'string') return nativeSend.apply(xhr, args);
+
+    // Standing down means the extension sends nothing of its own for the rest
+    // of the page. Substituting a figure it already holds costs no request, so
+    // those surfaces go on being converted from what is remembered - and where
+    // nothing is remembered they leave the figures raw and say so. The two
+    // techniques that work by asking the server a different question have
+    // nothing to fall back on, so they stop.
 
     // The dashboard's own queries name their metric, so they only need the
     // metric swapped on the way out and restored on the way in. Queries this
     // extension issues carry their own label and are left alone.
-    if (url.indexOf(DASHBOARD_PATH) !== -1 && !skipped('join')) {
+    if (url.indexOf(DASHBOARD_PATH) !== -1 && !skipped('join') && !standingDown()) {
       if (body.indexOf('"' + SOURCE_METRIC + '"') === -1 || body.indexOf('"' + TARGET_METRIC + '"') !== -1) {
         return nativeSend.apply(xhr, args);
       }
       return proxy(xhr, body, swapRequestedMetric, dashboardConverter);
     }
 
-    if (url.indexOf(JOIN_PATH) !== -1 && !skipped('join')) {
+    if (url.indexOf(JOIN_PATH) !== -1 && !skipped('join') && !standingDown()) {
       var ours = body.indexOf('"realview"') !== -1;
       var hasSource = body.indexOf('"' + SOURCE_METRIC + '"') !== -1;
       // A query that already asks for both metrics would end up with a
