@@ -43,6 +43,10 @@ and pin RealView to see it. The popup has three switches:
   the switch above turned off the graphs go back to YouTube's own blue.
 - **Log to the console** — for diagnosing a problem. Leave it off for normal use.
 
+After RealView updates itself, a small red **1** appears on the toolbar icon. Open the popup and
+it shows what changed in that version, then the badge clears. Nothing opens on its own: no tab, no
+notification, no page — the badge is the only thing that ever asks for your attention.
+
 ### Things worth knowing
 
 - Chrome shows a "Disable developer mode extensions" warning each time it starts. That is normal
@@ -332,7 +336,9 @@ Any subset of those names is left entirely alone until you set it back to `''`.
 | `bridge.js` | isolated world | Mirrors saved settings onto `<html>` |
 | `relabel.js` | isolated world | Corrects the wording Studio writes itself |
 | `charts.css` | isolated world | Paints the charts red |
-| `popup.html` / `popup.js` | popup | Three switches, stored in `chrome.storage.sync` |
+| `popup.html` / `popup.js` | popup | Three switches, stored in `chrome.storage.sync`, and the what's-new section |
+| `background.js` | service worker | Marks an update unread and puts the badge on the icon |
+| `changelog.json` | popup | What changed in each version, newest first |
 
 Developers can point **Load unpacked** at this repository's `src` directory instead of the
 packaged folder.
@@ -340,6 +346,7 @@ packaged folder.
 ## Tests
 
     node test/interceptor.test.js
+    node test/changelog.test.js
 
 `test/harness.js` stands up a miniature Studio — a scripted `XMLHttpRequest`, a document element
 carrying the settings, an event target — and loads `src/interceptor.js` into it unmodified. The
@@ -348,6 +355,23 @@ a failing query, the figures one is answered from and the quarter of an hour the
 behind it, an error from Studio, the disabled state, the exact event sequence a rewritten response
 is delivered with, an exception inside the extension, and the fault limit standing the extension
 down — still serving what it remembers and asking for nothing.
+
+`test/changelog.test.js` checks `src/changelog.json` itself — every entry has a three-number
+version, a real date and some plain-English changes, the entries run newest first with no version
+twice — and that the newest entry is the version in `manifest.json`, which is what fails when a
+release bumps the version and forgets to say what changed. It also loads `src/background.js` with a
+fake Chrome and checks what an update, a second update nobody read, a fresh install and a browser
+restart each do to the badge.
+
+### Releasing
+
+1. Bump `"version"` in `src/manifest.json`. A bug fix moves the third number up by one. A new
+   feature moves the middle number up by one and leaves the third where it is, so 1.5.4 becomes
+   1.6.4. The third number carries on counting and is never reset.
+2. Add an entry at the top of `src/changelog.json` with that version, today's date and a line per
+   change, written for whoever uses the extension rather than whoever wrote it — what they will see
+   differently, not which function changed.
+3. Run both test files. `test/changelog.test.js` fails if step 2 was skipped.
 
 ## License
 

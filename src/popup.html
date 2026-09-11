@@ -50,6 +50,73 @@
         opacity: 0.45;
         cursor: default;
       }
+      details.whats-new {
+        padding: 9px 0;
+        border-top: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+      }
+      details.whats-new summary {
+        cursor: pointer;
+        font-weight: 500;
+      }
+      .new-tag {
+        margin-left: 6px;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        color: #c00;
+      }
+      /* The extension's red is dark enough to all but vanish against a dark
+         popup, and this tag is small bold text that has to be readable at a
+         glance, so dark mode is given a lighter red instead. */
+      @media (prefers-color-scheme: dark) {
+        .new-tag {
+          color: #ff5c5c;
+        }
+      }
+      .changelog {
+        margin-top: 8px;
+      }
+      .changelog .earlier {
+        max-height: 220px;
+        overflow-y: auto;
+        margin-top: 10px;
+        padding-top: 8px;
+        border-top: 1px dashed color-mix(in srgb, CanvasText 15%, transparent);
+      }
+      .changelog h2 {
+        margin: 0 0 3px;
+        font-size: 13px;
+        font-weight: 500;
+      }
+      .changelog h2 span {
+        margin-left: 6px;
+        font-weight: 400;
+        opacity: 0.65;
+      }
+      .changelog ul {
+        margin: 0 0 10px;
+        padding-left: 16px;
+      }
+      .changelog li {
+        opacity: 0.65;
+        line-height: 1.35;
+        overflow-wrap: break-word;
+      }
+      .changelog .entry:last-child ul,
+      .changelog .earlier .entry:last-child ul {
+        margin-bottom: 0;
+      }
+      button.more {
+        margin-top: 8px;
+        padding: 0;
+        border: 0;
+        background: none;
+        font: inherit;
+        color: inherit;
+        opacity: 0.65;
+        text-decoration: underline;
+        cursor: pointer;
+      }
       footer {
         margin-top: 12px;
         padding-top: 10px;
@@ -86,6 +153,14 @@
         <span>Reports what was converted, and why a conversion was skipped.</span>
       </span>
     </label>
+
+    <!-- Hidden until the changelog has been read and parsed, so a missing or
+         broken file leaves the popup looking exactly as it did before. -->
+    <details class="whats-new" id="whats-new" hidden>
+      <summary id="whats-new-summary"></summary>
+      <div class="changelog" id="changelog"></div>
+      <button type="button" class="more" id="show-earlier" hidden>Show earlier versions</button>
+    </details>
 
     <footer id="status">Reload YouTube Studio after changing a setting.</footer>
     <script src="popup.js"></script>
