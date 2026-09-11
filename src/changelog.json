@@ -1,0 +1,51 @@
+[
+  {
+    "version": "1.6.0",
+    "date": "2026-09-11",
+    "changes": [
+      "The popup now has a \"What's new\" section listing what changed in each update you have not read yet, with earlier versions tucked behind a link.",
+      "A small red 1 appears on the toolbar icon after an update, and clears the moment you open the popup.",
+      "Nothing opens on its own: no tab, no notification, no page."
+    ]
+  },
+  {
+    "version": "1.5.4",
+    "date": "2026-09-11",
+    "changes": [
+      "Every bar in the latest-video ranking now moves as figures come in, not only the newest video's.",
+      "Charts that mark every few minutes rise steadily instead of jumping once an hour.",
+      "When a query fails, the last real figures are shown for up to fifteen minutes rather than leaving the number raw.",
+      "Failed queries are retried quietly in the background so the next page load finds them answered."
+    ]
+  },
+  {
+    "version": "1.5.3",
+    "date": "2026-09-01",
+    "changes": [
+      "The latest-video card's arrow and typical band are now judged from engaged views rather than raw ones.",
+      "The dashboard's top-content list is no longer converted twice, which had replaced right figures with wrong ones."
+    ]
+  },
+  {
+    "version": "1.5.2",
+    "date": "2026-08-31",
+    "changes": [
+      "The Audience tab is converted: age and gender, top geographies, subtitle languages and interests."
+    ]
+  },
+  {
+    "version": "1.5.1",
+    "date": "2026-08-31",
+    "changes": [
+      "Tables split two ways, such as age against gender, are converted.",
+      "Cards with All, Videos, Shorts and Live tabs show each tab's own figures instead of the whole channel's."
+    ]
+  },
+  {
+    "version": "1.5.0",
+    "date": "2026-08-31",
+    "changes": [
+      "The latest-video ranking (\"6 of 10\") is rebuilt from engaged views and reordered to match."
+    ]
+  }
+]
