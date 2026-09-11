@@ -22,44 +22,89 @@ function compareVersions(a, b) {
 
 // A fake Chrome for src/background.js: listeners are captured so a test can
 // call them, storage is a plain object, and badge calls are recorded.
-function fakeChrome(stored, version) {
+function fakeChrome(stored, version, synced) {
   const calls = { badgeText: [], badgeColour: [] };
   const listeners = {};
+  // Both storage areas answer the same way: the defaults the caller asked for,
+  // overlaid with whatever has actually been stored.
+  function area(store) {
+    return {
+      get(defaults, callback) {
+        const out = {};
+        Object.keys(defaults).forEach((key) => {
+          out[key] = store[key] === undefined ? defaults[key] : store[key];
+        });
+        callback(out);
+      },
+      set(values, callback) {
+        Object.keys(values).forEach((key) => { store[key] = values[key]; });
+        if (callback) callback();
+      }
+    };
+  }
   const chrome = {
     runtime: {
       getManifest: () => ({ version }),
+      getURL: (file) => 'chrome-extension://realview/' + file,
       onInstalled: { addListener(fn) { listeners.installed = fn; } },
-      onStartup: { addListener(fn) { listeners.startup = fn; } }
+      onStartup: { addListener(fn) { listeners.startup = fn; } },
+      onMessage: { addListener(fn) { listeners.message = fn; } }
     },
     storage: {
-      local: {
-        get(defaults, callback) {
-          const out = {};
-          Object.keys(defaults).forEach((key) => {
-            out[key] = stored[key] === undefined ? defaults[key] : stored[key];
-          });
-          callback(out);
-        },
-        set(values, callback) {
-          Object.keys(values).forEach((key) => { stored[key] = values[key]; });
-          if (callback) callback();
-        }
-      }
+      local: area(stored),
+      sync: area(synced)
     },
     action: {
       setBadgeText(details) { calls.badgeText.push(details.text); },
       setBadgeBackgroundColor(details) { calls.badgeColour.push(details.color); }
     }
   };
-  return { chrome, calls, listeners, stored };
+  return { chrome, calls, listeners, stored, synced };
 }
 
-function loadBackground(stored, version) {
-  const env = fakeChrome(stored || {}, version || manifest.version);
+function loadBackground(stored, version, synced) {
+  const env = fakeChrome(stored || {}, version || manifest.version, synced || {});
   const source = fs.readFileSync(path.join(SRC, 'background.js'), 'utf8');
-  vm.runInNewContext(source, { chrome: env.chrome, console });
+  // The background reaches for changelog.json over fetch, which a bare vm
+  // context has no notion of, so it is served the real file from disk.
+  const fetch = () => Promise.resolve({ json: () => Promise.resolve(changelog) });
+  vm.runInNewContext(source, { chrome: env.chrome, console, fetch });
   return env;
 }
+
+// The answer is built inside the vm context, so its prototype is that realm's
+// Object rather than this one's and a deep comparison would fail on that alone.
+// Only the fields matter here, so they are copied into a plain local object.
+function plain(response) {
+  const out = {};
+  Object.keys(response).forEach((key) => { out[key] = response[key]; });
+  return out;
+}
+
+// A message is answered through a callback rather than a return value, so the
+// call is turned into a promise. The value the listener returned is handed back
+// alongside it, since that is what decides whether the channel stays open.
+function sendMessage(env, message) {
+  let settle;
+  const answered = new Promise((resolve) => { settle = resolve; });
+  const kept = env.listeners.message(message, {}, (response) => settle(response));
+  return { kept, answered };
+}
+
+// Whether an answer ever arrives at all: a listener that declines a message
+// must never call back, and the only way to see that is to wait a moment.
+function answeredWithin(promise) {
+  const nothing = Symbol('nothing');
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(nothing), 25))
+  ]).then((value) => (value === nothing ? null : { value }));
+}
+
+// The toast reports the version it is actually running, so these tests pin
+// themselves to the newest entry rather than to whatever the manifest says,
+// which lets them pass while a release is half done.
+const NEWEST = changelog[0];
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -161,6 +206,61 @@ test('a restart with nothing unread leaves the toolbar alone', () => {
   const env = loadBackground({ lastSeenVersion: '1.5.4', unread: false }, '1.5.4');
   env.listeners.startup();
   assert.deepStrictEqual(env.calls.badgeText, []);
+});
+
+test('an unread update answers the toast with this version\'s entry', async () => {
+  const env = loadBackground({ lastSeenVersion: '1.5.4', unread: true }, NEWEST.version, {});
+  const { kept, answered } = sendMessage(env, { type: 'realview-toast-query' });
+
+  assert.strictEqual(kept, true, 'the channel is held open for the async answer');
+  const reply = await answered;
+  assert.strictEqual(reply.show, true);
+  assert.strictEqual(reply.version, NEWEST.version);
+  assert.strictEqual(reply.date, NEWEST.date);
+  assert.deepStrictEqual(reply.changes, NEWEST.changes);
+  assert.strictEqual(env.stored.toastShownFor, NEWEST.version, 'the card is marked as shown');
+});
+
+test('the toast is answered once per version and not again', async () => {
+  const env = loadBackground({ lastSeenVersion: '1.5.4', unread: true }, NEWEST.version, {});
+  await sendMessage(env, { type: 'realview-toast-query' }).answered;
+
+  const second = await sendMessage(env, { type: 'realview-toast-query' }).answered;
+  assert.deepStrictEqual(plain(second), { show: false }, 'a second Studio tab gets no card');
+});
+
+test('the toast switch turned off keeps the card away', async () => {
+  const env = loadBackground({ lastSeenVersion: '1.5.4', unread: true }, NEWEST.version, { toast: false });
+  const reply = await sendMessage(env, { type: 'realview-toast-query' }).answered;
+
+  assert.deepStrictEqual(plain(reply), { show: false });
+  assert.strictEqual(env.stored.toastShownFor, undefined,
+    'and nothing is spent, so the card still waits for the switch to come back on');
+});
+
+test('nothing unread means nothing to say', async () => {
+  const env = loadBackground({ lastSeenVersion: NEWEST.version, unread: false }, NEWEST.version, {});
+  const reply = await sendMessage(env, { type: 'realview-toast-query' }).answered;
+  assert.deepStrictEqual(plain(reply), { show: false });
+});
+
+test('closing the card counts as having read the news', async () => {
+  const env = loadBackground({ lastSeenVersion: '1.5.4', unread: true }, NEWEST.version, {});
+  const { kept, answered } = sendMessage(env, { type: 'realview-toast-seen' });
+
+  assert.strictEqual(kept, true);
+  assert.deepStrictEqual(plain(await answered), { ok: true });
+  assert.strictEqual(env.stored.unread, false);
+  assert.strictEqual(env.stored.lastSeenVersion, NEWEST.version);
+  assert.deepStrictEqual(env.calls.badgeText, [''], 'the badge is cleared');
+});
+
+test('a message meant for somebody else is left alone', async () => {
+  const env = loadBackground({ lastSeenVersion: '1.5.4', unread: true }, NEWEST.version, {});
+  const { kept, answered } = sendMessage(env, { type: 'something-else-entirely' });
+
+  assert.strictEqual(kept, false, 'so another listener could still answer it');
+  assert.strictEqual(await answeredWithin(answered), null, 'and no answer is sent');
 });
 
 (async () => {

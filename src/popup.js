@@ -1,10 +1,11 @@
 (function () {
   'use strict';
 
-  var DEFAULTS = { rewrite: true, color: true, debug: false };
+  var DEFAULTS = { rewrite: true, color: true, toast: true, debug: false };
   var inputs = {
     rewrite: document.getElementById('rewrite'),
     color: document.getElementById('color'),
+    toast: document.getElementById('toast'),
     debug: document.getElementById('debug')
   };
 
@@ -19,6 +20,9 @@
   chrome.storage.sync.get(DEFAULTS, function (stored) {
     inputs.rewrite.checked = stored.rewrite !== false;
     inputs.color.checked = stored.color !== false;
+    // The update card says nothing about views, so it stands on its own rather
+    // than following the main switch the way the chart colour does.
+    inputs.toast.checked = stored.toast !== false;
     inputs.debug.checked = stored.debug === true;
     reflectDependency();
   });
@@ -28,6 +32,7 @@
     chrome.storage.sync.set({
       rewrite: inputs.rewrite.checked,
       color: inputs.color.checked,
+      toast: inputs.toast.checked,
       debug: inputs.debug.checked
     });
   }
