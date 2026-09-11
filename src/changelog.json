@@ -1,6 +1,6 @@
 [
   {
-    "version": "1.5.5",
+    "version": "1.6.4",
     "date": "2026-09-11",
     "changes": [
       "The popup now has a \"What's new\" section listing what changed in each update you have not read yet, with earlier versions tucked behind a link.",

@@ -365,8 +365,9 @@ restart each do to the badge.
 
 ### Releasing
 
-1. Bump `"version"` in `src/manifest.json`: the third number goes up by one and carries on
-   counting rather than resetting, whatever the release contains.
+1. Bump `"version"` in `src/manifest.json`. A bug fix moves the third number up by one. A new
+   feature moves the middle number up by one and leaves the third where it is, so 1.5.4 becomes
+   1.6.4. The third number carries on counting and is never reset.
 2. Add an entry at the top of `src/changelog.json` with that version, today's date and a line per
    change, written for whoever uses the extension rather than whoever wrote it — what they will see
    differently, not which function changed.
