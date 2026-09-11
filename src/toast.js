@@ -21,7 +21,7 @@
   // the card is held back until the screen it belongs to is actually there.
   var SETTLE_MS = 1500;
   var REMOVE_MS = 250;
-  var HIDE_MS = 4000;
+  var HIDE_MS = 8000;
   var SLIDE_MS = 300;
   var FIRST_BULLETS = 2;
 
@@ -44,6 +44,7 @@
     '  color: #ff5c5c; font-size: 11px; font-weight: 700;',
     '  letter-spacing: 0.04em; text-transform: uppercase;',
     '}',
+    '.kind { color: #aaa; }',
     '.close {',
     '  width: 20px; height: 20px; padding: 0; border: 0; background: none;',
     '  color: #aaa; font: inherit; font-size: 16px; line-height: 20px;',
@@ -115,6 +116,12 @@
     var brand = document.createElement('span');
     brand.className = 'brand';
     brand.textContent = 'RealView';
+    // Studio has its own cards and notices, so the label says plainly that this
+    // one comes from an extension and not from YouTube.
+    var kind = document.createElement('span');
+    kind.className = 'kind';
+    kind.textContent = ' \u00b7 Extension';
+    brand.appendChild(kind);
     var close = document.createElement('button');
     close.type = 'button';
     close.className = 'close';
@@ -156,7 +163,7 @@
     foot.textContent = 'The full history is in the RealView popup on the toolbar.';
     card.appendChild(foot);
 
-    // The four seconds are counted from the end of the slide rather than from
+    // The eight seconds are counted from the end of the slide rather than from
     // the moment the card is added, so the card is readable for all of them
     // instead of spending part of them arriving.
     var hideTimer = null;
@@ -185,7 +192,7 @@
     }
 
     // A pointer resting on the card, or the keyboard focus sitting inside it,
-    // means it is being read. Leaving gives it a fresh four seconds rather than
+    // means it is being read. Leaving gives it a fresh eight seconds rather than
     // whatever was left, which is simpler than tracking the remainder and
     // kinder to someone who looked away halfway through a sentence.
     card.addEventListener('mouseenter', stopHide);
