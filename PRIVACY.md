@@ -1,6 +1,6 @@
 # Privacy policy
 
-Last updated: 31 August 2026
+Last updated: 11 September 2026
 
 RealView is a Chrome extension that changes which view metric YouTube Studio
 displays. This page describes everything it does with data.
@@ -22,29 +22,44 @@ before Studio draws the page.
 To get the engaged-view figures, RealView asks YouTube's own analytics service
 for them, at the same `studio.youtube.com` address Studio itself uses, using the
 session you are already signed in with. Those requests go to YouTube and nowhere
-else. The answers are used to draw the page and are held in memory only, for up
-to a minute, so that moving between screens does not ask the same question
-twice. They are not written to disk.
+else. The answers are used to draw the page and are held in memory only. Most
+are kept for a minute, so that moving between screens does not ask the same
+question twice. The last good answer to each question is kept for up to fifteen
+minutes, so that a screen can still show engaged figures if YouTube's service
+fails to answer. Your videos' publish times are kept while the page is open.
+None of this is written to disk.
 
 This processing happens entirely on your computer. None of it is sent to the
 developer of this extension or to any third party.
 
 ## What it stores
 
-RealView stores three settings, the ones shown in its toolbar popup:
+RealView stores four settings, the ones shown in its toolbar popup:
 
 - whether to show engaged views
 - whether to colour the charts red
+- whether to show the update notice in Studio
 - whether to write diagnostic messages to the browser console
 
 They are stored with the Chrome `storage.sync` API, which is what Chrome
 provides for keeping a user's settings across the browsers they are signed into.
-If you have Chrome sync switched on, Chrome carries these three settings to your
+If you have Chrome sync switched on, Chrome carries these four settings to your
 other Chrome profiles, in the same way it carries your bookmarks. That transfer
 is between you and Chrome. The developer of this extension cannot see it.
 
-Nothing else is stored. RealView does not use cookies, local storage, session
-storage or a database, and it keeps no record of the analytics figures it reads.
+So that it can tell you what changed after an update, RealView also stores three
+small values on this computer only, with the Chrome `storage.local` API:
+
+- the last version whose changes you have seen
+- whether an update is waiting to be read
+- the version whose update notice has already been shown
+
+These are version numbers and a yes-or-no flag. They say nothing about you or
+your channel, and they never leave your browser.
+
+Nothing else is stored. RealView does not use cookies, the page's local or
+session storage, or a database, and it keeps no record of the analytics figures
+it reads.
 
 ## What it does not do
 
@@ -62,14 +77,16 @@ storage or a database, and it keeps no record of the analytics figures it reads.
 
 RealView requests two permissions, both needed for the single purpose above:
 
-- `storage`, required by the Chrome API that saves the three settings.
+- `storage`, required by the Chrome APIs that save the settings and the update
+  record.
 - Access to `https://studio.youtube.com/*`, the one site whose figures it
   changes. No other site is matched, and no request is made to any other domain.
 
 ## Removing your data
 
-The three settings are the only data that persists. Removing the extension from
-Chrome deletes them. You can also reset them at any time from the popup.
+The settings and the update record are the only data that persists. Removing the
+extension from Chrome deletes both. You can change the settings at any time from
+the popup.
 
 ## Children
 

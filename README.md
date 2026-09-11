@@ -59,8 +59,12 @@ notification, no page.
   for any extension installed this way, and can be dismissed. RealView keeps working.
 - RealView only runs on studio.youtube.com and does nothing on any other site.
 - No data is sent anywhere. The extension asks YouTube's own analytics service for the engaged
-  figures using your existing signed-in session, and shows them in place of the raw ones. Nothing
-  leaves your browser and nothing is stored.
+  figures using your existing signed-in session, and shows them in place of the raw ones. Those
+  figures are held in memory only and never written to disk. The only things saved are your four
+  switches and a note of which version's changes you have seen. The
+  [privacy policy](PRIVACY.md) has the details.
+- If YouTube's analytics service fails to answer, RealView keeps showing the last engaged figures
+  it got, for up to fifteen minutes, rather than switching back to the raw count.
 - Your channel is not modified. This changes what Studio shows you; other people see nothing
   different.
 - If a page ever looks wrong, switch **Use engaged views** off and reload. Studio returns to
