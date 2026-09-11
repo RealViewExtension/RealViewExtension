@@ -46,10 +46,12 @@ and pin RealView to see it. The popup has four switches:
 - **Log to the console** — for diagnosing a problem. Leave it off for normal use.
 
 After RealView updates itself, a small red **1** appears on the toolbar icon, and the next time you
-open Studio a small card in the bottom corner says what changed. Close the card and the badge
-clears, exactly as opening the popup does; the popup shows the same list whenever you want it
-again. If you would rather not see the card at all, turn **Update notice on Studio** off and the
-badge alone will tell you. Nothing opens on its own: no tab, no notification, no page.
+open Studio a small card in the bottom corner says what changed. The card slides away on its own
+after a few seconds, or sooner if you close it. Closing it clears the badge, exactly as opening the
+popup does, while a card that went away by itself leaves the badge where it is, so the popup still
+has the list for you to read later. If you would rather not see the card at all, turn **Update
+notice on Studio** off and the badge alone will tell you. Nothing opens on its own: no tab, no
+notification, no page.
 
 ### Things worth knowing
 
