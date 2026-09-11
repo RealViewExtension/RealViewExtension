@@ -6,6 +6,7 @@ const { createEnvironment, request } = require('./harness');
 const CHANNEL = 'UCtest';
 const OFFSET = -10800;
 const DAY = 86400000;
+const HOUR = 3600000;
 
 // The dates the fixtures use, expressed the way the API does.
 function dateId(ms) {
@@ -518,6 +519,313 @@ test('repeated faults make the extension stand down instead of repeating', async
   assert.ok(attempts[0] >= 1, 'it did try at first');
   assert.strictEqual(attempts[3], 0, 'and had stopped trying by the end, attempts were ' + attempts.join(','));
   assert.strictEqual(screenCalls, 4, 'and Studio kept getting its screens throughout');
+});
+
+// The content tab asks one query for its whole page, so it either succeeds or
+// fails as a whole: the simplest surface to watch a failed query on.
+const VIDEO_LIST_URL = 'https://studio.youtube.com/youtubei/v1/creator/list_creator_videos?alt=json';
+
+function videoListPage() {
+  return JSON.stringify({ videos: [{ videoId: 'vidA', channelId: CHANNEL, publicMetrics: { viewCount: '100' } }] });
+}
+
+function lifetimeCount(result) {
+  return JSON.parse(result.text).videos[0].publicMetrics.viewCount;
+}
+
+// A clock for the interceptor alone, so a retry due in a minute can be watched
+// without waiting one. The harness hands these to it in place of the page's
+// own setTimeout and clearTimeout.
+function fakeTimers() {
+  let now = 0;
+  let next = 1;
+  const pending = new Map();
+  return {
+    setTimeout(fn, delay) { pending.set(next, { fn, due: now + (delay || 0) }); return next++; },
+    clearTimeout(id) { pending.delete(id); },
+    // Runs a test with Date.now following this clock, so a cached answer that
+    // lasts a minute expires when the clock says a minute has gone by.
+    async holding(run) {
+      const real = Date.now;
+      const started = real();
+      Date.now = () => started + now;
+      try { return await run(); } finally { Date.now = real; }
+    },
+    // Moves the clock on and runs whatever that makes due, letting whatever
+    // each one sets off finish before the next.
+    async advance(ms) {
+      now += ms;
+      const due = [...pending].filter(([, timer]) => timer.due <= now).sort((a, b) => a[1].due - b[1].due);
+      for (const [id, timer] of due) {
+        pending.delete(id);
+        timer.fn();
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+  };
+}
+
+test('a query that failed is asked again rather than remembered as a failure', async () => {
+  let asked = 0;
+  const env = createEnvironment({
+    'list_creator_videos': videoListPage(),
+    // The first query is refused, everything after it is answered.
+    'yta_web/join': (body) => (++asked === 1 ? { status: 500, text: 'nope' } : joinResponder({ vidA: 40 })(body))
+  });
+
+  const first = await request(env, VIDEO_LIST_URL, JSON.stringify({ context: {} }));
+  assert.strictEqual(lifetimeCount(first), '100', 'the refused query leaves the count raw');
+
+  // A failure kept in the cache would be handed to every request for the next
+  // minute without anybody asking the server again.
+  const second = await request(env, VIDEO_LIST_URL, JSON.stringify({ context: {} }));
+  assert.strictEqual(lifetimeCount(second), '40', 'and the next request really does ask again');
+});
+
+test('a query that fails is answered from the figures it last really got', async () => {
+  let failing = false;
+  const env = createEnvironment({
+    'get_screen': screenResponse(),
+    'yta_web/join': (body) => (failing ? { status: 500, text: 'nope' } : joinResponder()(body))
+  });
+  const url = 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json';
+
+  const first = await request(env, url, screenRequest());
+  assert.strictEqual(JSON.parse(first.text).cards[1].keyMetricCardData.keyMetricTabs[0].primaryContent.total, 7);
+
+  // Two minutes on, the cached answers have expired and the screen really asks
+  // again - and the query endpoint has stopped answering.
+  failing = true;
+  const later = await at(Date.now() + 2 * 60000, () => request(env, url, screenRequest()));
+  const content = JSON.parse(later.text).cards[1].keyMetricCardData.keyMetricTabs[0].primaryContent;
+
+  assert.strictEqual(content.total, 7, 'the figures the screen last really had are shown');
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'yes', 'and it is still an engaged screen');
+});
+
+test('figures older than a quarter of an hour are not shown at all', async () => {
+  let failing = false;
+  const env = createEnvironment({
+    'get_screen': screenResponse(),
+    'yta_web/join': (body) => (failing ? { status: 500, text: 'nope' } : joinResponder()(body))
+  });
+  const url = 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json';
+
+  await request(env, url, screenRequest());
+  failing = true;
+  const later = await at(Date.now() + 16 * 60000, () => request(env, url, screenRequest()));
+
+  assert.strictEqual(later.text, screenResponse(), 'the screen is served exactly as Studio sent it');
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'no', 'and the wording says so rather than claiming engaged views');
+});
+
+test('standing down still shows what it remembers, and asks for nothing', async () => {
+  let failing = false;
+  let refusals = 0;
+  let stoodDownAt = null;
+  const env = createEnvironment({
+    'get_screen': screenResponse(),
+    'yta_web/join': (body) => {
+      if (!failing) return joinResponder()(body);
+      // The second refusal is the one that reaches the fault limit, and the
+      // fault is counted the moment this reply is handed over. Whatever is
+      // sent from this point on is sent by an extension that has promised to
+      // send nothing - so the count starts here rather than at the next
+      // request, which would let a fan-out behind this very batch through.
+      if (++refusals === 2) stoodDownAt = env.sent.length;
+      return { status: 500, text: 'nope' };
+    }
+  });
+  const url = 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json';
+
+  await request(env, url, screenRequest());
+  // The query endpoint breaks, which is what stands the extension down.
+  failing = true;
+  await at(Date.now() + 2 * 60000, () => request(env, url, screenRequest()));
+  const later = await at(Date.now() + 3 * 60000, () => request(env, url, screenRequest()));
+
+  assert.ok(stoodDownAt !== null, 'the queries really did fail twice');
+  assert.deepStrictEqual(
+    env.sent.slice(stoodDownAt).map((entry) => entry.url),
+    [url],
+    "the only thing sent afterwards was Studio's own screen request, relayed - no query, no video lookup"
+  );
+  const content = JSON.parse(later.text).cards[1].keyMetricCardData.keyMetricTabs[0].primaryContent;
+  assert.strictEqual(content.total, 7, 'and the screen still carries the figures it remembers');
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'yes');
+});
+
+test('standing down does not look a video up either', async () => {
+  // The ranking dates its videos from Studio's own video list, which is a
+  // request like any other: once the extension has stood down it goes without.
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidD' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidE' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } }
+  ] };
+  const env = createEnvironment({
+    'get_screen': JSON.stringify({ cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidD' }, ranking } }] }),
+    'list_creator_videos': () => ({ status: 500, text: 'nope' }),
+    'yta_web/join': () => ({ status: 500, text: 'nope' })
+  });
+  const url = 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json';
+  // The first screen's own queries all fail, which is what stands the
+  // extension down; from the next request on it sends nothing of its own.
+  await request(env, url, screenRequest());
+  const before = env.sent.length;
+  const later = await request(env, url, screenRequest());
+
+  assert.deepStrictEqual(
+    env.sent.slice(before).map((entry) => entry.url),
+    [url],
+    "Studio's own screen request was relayed and nothing else went out - no video lookup, no query"
+  );
+  const entities = JSON.parse(later.text).cards[0].entitySnapshotCardData.ranking.entities;
+  assert.deepStrictEqual(entities.map((e) => e.entity.videoId), ['vidD', 'vidE'], 'and the ranking is left exactly as the server sent it');
+});
+
+test('a batch already in flight when it stands down is not split up and sent again', async () => {
+  // A batch that comes back missing is normally asked again query by query,
+  // which is several fresh requests. If it was that batch's own failure that
+  // reached the fault limit, those requests would go out from an extension
+  // that had just promised to send nothing at all.
+  const env = createEnvironment({
+    'list_creator_videos': videoListPage(),
+    'get_screen': screenResponse(),
+    'yta_web/join': () => ({ status: 500, text: 'nope' })
+  });
+  const url = 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json';
+
+  // The video list asks one question, so its refusal is one fault and there is
+  // nothing to split up: the extension is one fault short of standing down.
+  await request(env, VIDEO_LIST_URL, JSON.stringify({ context: {} }));
+  const before = env.sent.length;
+
+  // The screen asks several questions at once, and the refusal of that batch
+  // is the fault that stands the extension down.
+  const later = await request(env, url, screenRequest());
+
+  const joins = env.sent.slice(before).filter((entry) => entry.url.includes('yta_web/join'));
+  assert.strictEqual(joins.length, 1, 'the batch went out once and no stragglers followed it');
+  assert.ok(JSON.parse(joins[0].body).nodes.length > 1, 'and it really was a batch of several queries');
+  assert.strictEqual(later.text, screenResponse(), 'the screen is served exactly as Studio sent it');
+});
+
+test('a failed query is asked again at five, fifteen and sixty seconds', async () => {
+  const timers = fakeTimers();
+  let joins = 0;
+  const env = createEnvironment({
+    'list_creator_videos': videoListPage(),
+    'yta_web/join': () => { joins++; return { status: 500, text: 'nope' }; }
+  }, { timers });
+
+  await request(env, VIDEO_LIST_URL, JSON.stringify({ context: {} }));
+  const asked = joins;
+
+  await timers.advance(4000);
+  assert.strictEqual(joins, asked, 'nothing before the first delay is up');
+  await timers.advance(1000);
+  assert.strictEqual(joins, asked + 1, 'the first retry goes out five seconds after the failure');
+  await timers.advance(15000);
+  assert.strictEqual(joins, asked + 2, 'the second fifteen seconds after that one');
+  await timers.advance(60000);
+  assert.strictEqual(joins, asked + 3, 'and the third a minute after that');
+  await timers.advance(600000);
+  assert.strictEqual(joins, asked + 3, 'then it gives up rather than asking forever');
+
+  // None of those three counted as a fault, so the extension has not stood
+  // down and a request of Studio's own still gets a query of its own.
+  await request(env, VIDEO_LIST_URL, JSON.stringify({ context: {} }));
+  assert.strictEqual(joins, asked + 4, 'a retry that fails is not a fault');
+});
+
+test("a retry's answer is waiting for the next request", async () => {
+  const timers = fakeTimers();
+  let joins = 0;
+  let failing = true;
+  const env = createEnvironment({
+    'list_creator_videos': videoListPage(),
+    'yta_web/join': (body) => { joins++; return failing ? { status: 500, text: 'nope' } : joinResponder({ vidA: 40 })(body); }
+  }, { timers });
+
+  const first = await request(env, VIDEO_LIST_URL, JSON.stringify({ context: {} }));
+  assert.strictEqual(lifetimeCount(first), '100', 'the first page is served raw');
+
+  failing = false;
+  await timers.advance(5000);
+  assert.strictEqual(joins, 2, 'the retry went out on its own');
+
+  const second = await request(env, VIDEO_LIST_URL, JSON.stringify({ context: {} }));
+  assert.strictEqual(lifetimeCount(second), '40', 'and the next page is converted');
+  assert.strictEqual(joins, 2, 'from the answer already waiting, without asking again');
+});
+
+test('a request of its own calls off the retry behind it', async () => {
+  const timers = fakeTimers();
+  let joins = 0;
+  let failing = true;
+  const env = createEnvironment({
+    'list_creator_videos': videoListPage(),
+    'yta_web/join': (body) => { joins++; return failing ? { status: 500, text: 'nope' } : joinResponder({ vidA: 40 })(body); }
+  }, { timers });
+
+  await timers.holding(async () => {
+    await request(env, VIDEO_LIST_URL, JSON.stringify({ context: {} }));
+    await timers.advance(5000);
+    await timers.advance(15000);
+
+    // A request of Studio's own makes the attempt the chain was waiting to
+    // make, so the third retry has nothing left to do.
+    failing = false;
+    const second = await request(env, VIDEO_LIST_URL, JSON.stringify({ context: {} }));
+    assert.strictEqual(lifetimeCount(second), '40', 'the request asked for itself and was answered');
+
+    // Far enough past the third retry that its answer would have expired too,
+    // so a chain still running would really have sent something.
+    const asked = joins;
+    await timers.advance(70000);
+    assert.strictEqual(joins, asked, 'and the chain behind it was called off rather than asking again');
+  });
+});
+
+test('standing down calls off the retries as well', async () => {
+  const timers = fakeTimers();
+  let joins = 0;
+  const env = createEnvironment({
+    'get_screen': screenResponse(),
+    'yta_web/join': () => { joins++; return { status: 500, text: 'nope' }; }
+  }, { timers });
+
+  await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const asked = joins;
+
+  await timers.advance(600000);
+  assert.strictEqual(joins, asked, 'nothing was asked again once it had stood down');
+});
+
+test('a retry scheduled before the extension was turned off does not go out', async () => {
+  // The retries run a minute and more behind the request that scheduled them,
+  // which is long enough for the popup's switch to have moved. An extension
+  // that is off sends nothing, in the background as much as in front of a
+  // waiting screen.
+  const timers = fakeTimers();
+  let joins = 0;
+  const env = createEnvironment({
+    'list_creator_videos': videoListPage(),
+    'yta_web/join': () => { joins++; return { status: 500, text: 'nope' }; }
+  }, { timers });
+
+  await request(env, VIDEO_LIST_URL, JSON.stringify({ context: {} }));
+  const asked = joins;
+
+  // The bridge mirrors the popup's switch onto the document element, which is
+  // where the interceptor reads it.
+  env.attributes['data-realview-rewrite'] = 'off';
+
+  await timers.advance(5000);
+  assert.strictEqual(joins, asked, 'the retry that was due says nothing');
+  await timers.advance(600000);
+  assert.strictEqual(joins, asked, 'and the chain behind it is not carried on either');
 });
 
 test('the channel dashboard asks for the engaged metric and reads back its own', async () => {
@@ -1099,6 +1407,70 @@ test("the latest-video card's views row is converted", async () => {
   assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'yes', 'so the card no longer holds the wording back');
 });
 
+// The ranking asks about each video hour by hour, so a fixture answers a HOUR
+// query with the buckets of the window it names and anything else with a plain
+// per-video total. By default a video's whole figure sits in the window's first
+// hour, which keeps the arithmetic out of the way of a test about the order;
+// `everyHour` puts that much in every hour instead, for the tests about how the
+// last one is prorated. The server omits an hour with no views, so the fixture
+// does too.
+function rankingResponder(engaged, options = {}) {
+  const refuse = options.refuse || [];
+  // `refuse` names a video the server will not break down by hour but will
+  // still total; `deny` names one it will not answer for at all.
+  const deny = options.deny || [];
+  return (body) => ({
+    status: 200,
+    text: JSON.stringify({
+      results: JSON.parse(body).nodes.map((node) => {
+        const query = node.value.query;
+        if (options.queries) options.queries.push(query);
+        const wanted = (query.restricts.find((r) => r.dimension.type === 'VIDEO') || { inValues: [] }).inValues;
+        const figure = (id) => (engaged[id] === undefined ? 0 : engaged[id]);
+
+        if (wanted.length === 1 && deny.indexOf(wanted[0]) !== -1) {
+          return { key: node.key, value: { failure: { errorCode: 'INVALID_ARGUMENT' } } };
+        }
+        if ((query.dimensions[0] || {}).type !== 'HOUR') {
+          return { key: node.key, value: { resultTable: {
+            dimensionColumns: [{ dimension: { type: 'VIDEO' }, strings: { values: wanted } }],
+            metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: wanted.map(figure) } }]
+          } } };
+        }
+        if (refuse.indexOf(wanted[0]) !== -1) return { key: node.key, value: { failure: { errorCode: 'INVALID_ARGUMENT' } } };
+
+        const start = Number(query.timeRange.unixTimeRange.inclusiveStart) * 1000;
+        const end = Number(query.timeRange.unixTimeRange.exclusiveEnd) * 1000;
+        const labels = [];
+        const values = [];
+        for (let at = start; at < end; at += HOUR) {
+          if (!options.everyHour && at !== start) continue;
+          labels.push(String(at));
+          values.push(figure(wanted[0]));
+        }
+        return { key: node.key, value: { resultTable: {
+          dimensionColumns: [{ dimension: { type: 'HOUR' }, timestamps: { values: labels } }],
+          metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values } }]
+        } } };
+      })
+    })
+  });
+}
+
+// The publish times a ranking fixture hands back, as the video list states them.
+function videoList(times) {
+  return () => ({ status: 200, text: JSON.stringify({
+    videos: Object.keys(times).map((id) => ({ videoId: id, timePublishedSeconds: String(Math.floor(times[id] / 1000)) }))
+  }) });
+}
+
+// Freezes the clock so a prorated figure comes out to an exact number.
+async function at(moment, run) {
+  const real = Date.now;
+  Date.now = () => moment;
+  try { return await run(); } finally { Date.now = real; }
+}
+
 test('the latest-video ranking is rebuilt from engaged views', async () => {
   // Studio ranks the newest video against recent uploads over the same stretch
   // of each one's life. Raw order here is A, B, C; engaged order is C, A, B.
@@ -1111,29 +1483,12 @@ test('the latest-video ranking is rebuilt from engaged views', async () => {
   const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidA' }, ranking } }] };
 
   const engaged = { vidA: 20, vidB: 5, vidC: 60 };
-  const windows = {};
+  const queries = [];
 
   const env = createEnvironment({
     'get_screen': JSON.stringify(payload),
-    'list_creator_videos': () => ({ status: 200, text: JSON.stringify({ videos: [
-      { videoId: 'vidA', timePublishedSeconds: String(Math.floor((now - 3 * 3600000) / 1000)) },
-      { videoId: 'vidB', timePublishedSeconds: String(Math.floor((now - 40 * 3600000) / 1000)) },
-      { videoId: 'vidC', timePublishedSeconds: String(Math.floor((now - 90 * 3600000) / 1000)) }
-    ] }) }),
-    'yta_web/join': (body) => ({
-      status: 200,
-      text: JSON.stringify({
-        results: JSON.parse(body).nodes.map((node) => {
-          const id = (node.value.query.restricts.find((r) => r.dimension.type === 'VIDEO') || { inValues: [] }).inValues[0];
-          const range = node.value.query.timeRange.unixTimeRange;
-          if (id && range) windows[id] = Number(range.exclusiveEnd) - Number(range.inclusiveStart);
-          return { key: node.key, value: { resultTable: {
-            dimensionColumns: [{ dimension: { type: 'VIDEO' }, strings: { values: [id] } }],
-            metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [engaged[id] || 0] } }]
-          } } };
-        })
-      })
-    })
+    'list_creator_videos': videoList({ vidA: now - 3 * HOUR, vidB: now - 40 * HOUR, vidC: now - 90 * HOUR }),
+    'yta_web/join': rankingResponder(engaged, { queries })
   });
 
   const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
@@ -1143,8 +1498,12 @@ test('the latest-video ranking is rebuilt from engaged views', async () => {
   assert.deepStrictEqual(entities.map((e) => e.value.double), [60, 20, 5], 'showing the engaged figures');
   assert.deepStrictEqual(entities.map((e) => e.rank), [1, 2, 3], 'and renumbered');
 
-  const spans = Object.values(windows);
-  assert.strictEqual(new Set(spans).size, 1, 'every video measured over the same length of its own life');
+  // Each video is counted hour by hour rather than as one total over a window
+  // rounded out to whole hours, which is what lets every figure move between
+  // one hour and the next.
+  const asked = queries.filter((q) => q.restricts.some((r) => r.dimension.type === 'VIDEO'));
+  assert.strictEqual(asked.length, 3, 'one query per video in the list');
+  assert.ok(asked.every((q) => q.dimensions[0].type === 'HOUR'), 'every one of them asked for hours');
 });
 
 test('videos share a place when their figures tie', async () => {
@@ -1154,20 +1513,10 @@ test('videos share a place when their figures tie', async () => {
   })) };
   const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidA' }, ranking } }] };
 
-  const engaged = { vidA: 1, vidB: 0, vidC: 0 };
   const env = createEnvironment({
     'get_screen': JSON.stringify(payload),
-    'list_creator_videos': () => ({ status: 200, text: JSON.stringify({ videos: ['vidA', 'vidB', 'vidC'].map((id, i) => ({ videoId: id, timePublishedSeconds: String(Math.floor((now - (2 + i * 10) * 3600000) / 1000)) })) }) }),
-    'yta_web/join': (body) => ({
-      status: 200,
-      text: JSON.stringify({ results: JSON.parse(body).nodes.map((node) => {
-        const id = (node.value.query.restricts.find((r) => r.dimension.type === 'VIDEO') || { inValues: [] }).inValues[0];
-        return { key: node.key, value: { resultTable: {
-          dimensionColumns: [{ dimension: { type: 'VIDEO' }, strings: { values: [id] } }],
-          metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [engaged[id]] } }]
-        } } };
-      }) })
-    })
+    'list_creator_videos': videoList({ vidA: now - 2 * HOUR, vidB: now - 12 * HOUR, vidC: now - 22 * HOUR }),
+    'yta_web/join': rankingResponder({ vidA: 1, vidB: 0, vidC: 0 })
   });
 
   const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
@@ -1187,6 +1536,247 @@ test('a ranking is left alone when a video cannot be dated', async () => {
     // Only one of the two videos comes back with a publish time.
     'list_creator_videos': () => ({ status: 200, text: JSON.stringify({ videos: [{ videoId: 'vidA', timePublishedSeconds: '1780000000' }] }) }),
     'yta_web/join': joinResponder()
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const entities = JSON.parse(result.text).cards[0].entitySnapshotCardData.ranking.entities;
+  assert.deepStrictEqual(entities.map((e) => e.value.double), [900, 500], 'figures untouched');
+  assert.deepStrictEqual(entities.map((e) => e.rank), [1, 2], 'order untouched');
+});
+
+test("the hour a video's window ends inside is counted by its minutes", async () => {
+  // Every video is measured over exactly the newest one's age, which almost
+  // never lands on an hour boundary. Rounding that out used to freeze the nine
+  // older figures until the rounding grew; the hour the window ends inside is
+  // counted by the minutes of it the video has lived through instead.
+  const now = Math.floor(1780000000000 / HOUR) * HOUR;
+  const newest = now - 2 * HOUR - 10 * 60000;   // two hours and ten minutes old
+  const older = now - 10 * HOUR + 20 * 60000;   // published at twenty past the hour
+
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidNew' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidOld' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidNew' }, ranking } }] };
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'list_creator_videos': videoList({ vidNew: newest, vidOld: older }),
+    'yta_web/join': rankingResponder({ vidNew: 100, vidOld: 100 }, { everyHour: true })
+  });
+
+  const result = await at(now, () => request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest()));
+  const entities = JSON.parse(result.text).cards[0].entitySnapshotCardData.ranking.entities;
+  const figures = {};
+  entities.forEach((e) => { figures[e.entity.videoId] = e.value.double; });
+
+  // The older video's two hours and ten minutes run from twenty past, so it
+  // gets two whole hours and half of the one it ends in.
+  assert.strictEqual(figures.vidOld, 250, 'two full hours plus half of the third');
+  assert.strictEqual(figures.vidNew, 300, 'and the newest video its three whole hours');
+});
+
+test("the hour the newest video is living through counts whole", async () => {
+  // The newest video's window ends at this moment, so the hour it is in is the
+  // hour the server is still filling: what it holds is all there is so far, and
+  // scaling it down would report less than has really happened.
+  const hour = Math.floor(1780000000000 / HOUR) * HOUR;
+  const now = hour + 15 * 60000;
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidNew' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidOld' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidNew' }, ranking } }] };
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'list_creator_videos': videoList({ vidNew: now - 2 * HOUR, vidOld: now - 10 * HOUR }),
+    'yta_web/join': rankingResponder({ vidNew: 100, vidOld: 100 }, { everyHour: true })
+  });
+
+  const result = await at(now, () => request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest()));
+  const entities = JSON.parse(result.text).cards[0].entitySnapshotCardData.ranking.entities;
+  const figures = {};
+  entities.forEach((e) => { figures[e.entity.videoId] = e.value.double; });
+
+  assert.strictEqual(figures.vidNew, 300, 'the hour still being filled counts for everything it holds');
+  assert.strictEqual(figures.vidOld, 225, 'while an hour in the past is worth the minutes of it that count');
+});
+
+test('the figures move between one hour and the next', async () => {
+  // The complaint this fixes: nine of the ten bars stood still for up to an
+  // hour and then jumped together. Five minutes later the same card, answered
+  // the same way, has to read differently.
+  const start = Math.floor(1780000000000 / HOUR) * HOUR;
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidNew' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidOld' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidNew' }, ranking } }] };
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'list_creator_videos': videoList({ vidNew: start - 3 * HOUR, vidOld: start - 20 * HOUR }),
+    'yta_web/join': rankingResponder({ vidNew: 150, vidOld: 100 }, { everyHour: true })
+  });
+
+  function figureFor(result, id) {
+    const entities = JSON.parse(result.text).cards[0].entitySnapshotCardData.ranking.entities;
+    return entities.filter((e) => e.entity.videoId === id)[0].value.double;
+  }
+
+  const url = 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json';
+  const first = await at(start, () => request(env, url, screenRequest()));
+  const second = await at(start + 5 * 60000, () => request(env, url, screenRequest()));
+
+  // Studio prints these figures as text, so they are rounded before they are
+  // sorted and numbered; five minutes of the fourth hour still has to show.
+  assert.strictEqual(figureFor(first, 'vidOld'), 300, 'three whole hours to begin with');
+  assert.strictEqual(figureFor(second, 'vidOld'), 308, 'and five minutes of the fourth hour five minutes later');
+});
+
+test('a video the server will not break down by hour falls back to its total', async () => {
+  // An hourly query the server refuses costs that video its proration and
+  // nothing else: it is asked for again as a single total, and the other nine
+  // keep the figures they already have. The clock is held still on a whole
+  // hour of the newest video's life, so the window the total covers needs no
+  // rounding and the figure arrives as the server stated it.
+  const now = Math.floor(1780000000000 / HOUR) * HOUR;
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidA' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidB' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidA' }, ranking } }] };
+
+  const queries = [];
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'list_creator_videos': videoList({ vidA: now - 3 * HOUR, vidB: now - 30 * HOUR }),
+    'yta_web/join': rankingResponder({ vidA: 20, vidB: 50 }, { refuse: ['vidB'], queries })
+  });
+
+  const url = 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json';
+  const result = await at(now, () => request(env, url, screenRequest()));
+  const entities = JSON.parse(result.text).cards[0].entitySnapshotCardData.ranking.entities;
+
+  assert.deepStrictEqual(entities.map((e) => e.entity.videoId), ['vidB', 'vidA'], 'the ranking is still rebuilt');
+  assert.deepStrictEqual(entities.map((e) => e.value.double), [50, 20], 'the refused video counted as one total');
+
+  const totals = queries.filter((q) => (q.dimensions[0] || {}).type === 'VIDEO');
+  assert.strictEqual(totals.length, 1, 'only the refused video was asked for again');
+  assert.deepStrictEqual(totals[0].restricts.filter((r) => r.dimension.type === 'VIDEO')[0].inValues, ['vidB']);
+  // Three requests carry ranking queries: the batch, the straggler retry the
+  // extension makes for anything a batch comes back missing, and the single
+  // total. The nine videos the server did answer are never asked about twice.
+  const rankingJoins = env.sent
+    .filter((r) => r.url.includes('yta_web/join'))
+    .map((r) => JSON.parse(r.body).nodes.map((n) => n.key))
+    .filter((keys) => keys.some((key) => key.indexOf('rv_rank') === 0));
+  assert.deepStrictEqual(rankingJoins, [
+    ['rv_rank_hours_0', 'rv_rank_hours_1'],
+    ['rv_rank_hours_1'],
+    ['rv_rank_1']
+  ], 'the batch, the retry, and the one total');
+});
+
+test("a refused video's whole-hour total is scaled back to the window the others were counted over", async () => {
+  // The others are counted to the minute - two and a half hours of life - and
+  // the total the server will answer with covers three whole hours. Handing
+  // that over as it stands would credit this video with up to another
+  // fifty-nine minutes nobody else was given.
+  const now = Math.floor(1780000000000 / HOUR) * HOUR + 30 * 60000;
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidA' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidB' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidA' }, ranking } }] };
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    // vidA is the newest, so the list covers two and a half hours of each.
+    'list_creator_videos': videoList({ vidA: now - 2 * HOUR - 30 * 60000, vidB: now - 12 * HOUR }),
+    'yta_web/join': rankingResponder({ vidA: 100, vidB: 300 }, { refuse: ['vidB'] })
+  });
+
+  const url = 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json';
+  const result = await at(now, () => request(env, url, screenRequest()));
+  const entities = JSON.parse(result.text).cards[0].entitySnapshotCardData.ranking.entities;
+
+  assert.deepStrictEqual(entities.map((e) => e.entity.videoId), ['vidB', 'vidA']);
+  assert.deepStrictEqual(entities.map((e) => e.value.double), [250, 100],
+    'three hundred over three hours, counted for the two and a half the rest were given');
+});
+
+test('a ranking older than a fortnight is asked for as whole-hour totals', async () => {
+  // Ten videos broken down by the hour over months would be a great many
+  // buckets to ask for at once, so past a fortnight the old whole-hour total
+  // stands.
+  const now = Date.now();
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidA' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidB' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidA' }, ranking } }] };
+
+  const queries = [];
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'list_creator_videos': videoList({ vidA: now - 20 * DAY, vidB: now - 60 * DAY }),
+    'yta_web/join': rankingResponder({ vidA: 20, vidB: 50 }, { queries })
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const entities = JSON.parse(result.text).cards[0].entitySnapshotCardData.ranking.entities;
+
+  assert.deepStrictEqual(entities.map((e) => e.value.double), [50, 20], 'still rebuilt from engaged views');
+  const asked = queries.filter((q) => q.restricts.some((r) => r.dimension.type === 'VIDEO'));
+  assert.strictEqual(asked.length, 2, 'one query per video');
+  assert.ok(asked.every((q) => q.dimensions[0].type === 'VIDEO'), 'and not an hourly one among them');
+});
+
+test('the video list is only fetched once', async () => {
+  // A publish time never changes and the card loads constantly, so the list is
+  // remembered rather than asked for again.
+  const now = Date.now();
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidA' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidB' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidA' }, ranking } }] };
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'list_creator_videos': videoList({ vidA: now - 3 * HOUR, vidB: now - 30 * HOUR }),
+    'yta_web/join': rankingResponder({ vidA: 20, vidB: 50 })
+  });
+
+  const url = 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json';
+  await request(env, url, screenRequest());
+  const second = await request(env, url, screenRequest());
+
+  const entities = JSON.parse(second.text).cards[0].entitySnapshotCardData.ranking.entities;
+  assert.deepStrictEqual(entities.map((e) => e.value.double), [50, 20], 'the second card is rebuilt from the remembered times');
+  assert.strictEqual(env.sent.filter((r) => r.url.includes('list_creator_videos')).length, 1, 'and the list was asked for once');
+});
+
+test('a ranking with a video that has not gone up yet is left alone', async () => {
+  // An unpublished video reports a publish time of "0". It has no life to
+  // measure, so the ranking is left exactly as the server sent it rather than
+  // measured from 1970.
+  const now = Date.now();
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidA' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidB' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidA' }, ranking } }] };
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'list_creator_videos': () => ({ status: 200, text: JSON.stringify({ videos: [
+      { videoId: 'vidA', timePublishedSeconds: String(Math.floor((now - 3 * HOUR) / 1000)) },
+      { videoId: 'vidB', timePublishedSeconds: '0' }
+    ] }) }),
+    'yta_web/join': rankingResponder({ vidA: 20, vidB: 50 })
   });
 
   const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
@@ -1226,20 +1816,10 @@ test("the card's own comparison is redone from the rebuilt ranking", async () =>
     ] }
   } }] };
 
-  const engaged = { vidA: 20, vidB: 5, vidC: 60 };
   const env = createEnvironment({
     'get_screen': JSON.stringify(payload),
-    'list_creator_videos': () => ({ status: 200, text: JSON.stringify({ videos: ['vidA', 'vidB', 'vidC'].map((id, i) => ({ videoId: id, timePublishedSeconds: String(Math.floor((now - (3 + i * 30) * 3600000) / 1000)) })) }) }),
-    'yta_web/join': (body) => ({
-      status: 200,
-      text: JSON.stringify({ results: JSON.parse(body).nodes.map((node) => {
-        const wanted = (node.value.query.restricts.find((r) => r.dimension.type === 'VIDEO') || { inValues: [] }).inValues;
-        return { key: node.key, value: { resultTable: {
-          dimensionColumns: [{ dimension: { type: 'VIDEO' }, strings: { values: wanted } }],
-          metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: wanted.map((id) => engaged[id] || 0) } }]
-        } } };
-      }) })
-    })
+    'list_creator_videos': videoList({ vidA: now - 3 * HOUR, vidB: now - 33 * HOUR, vidC: now - 63 * HOUR }),
+    'yta_web/join': rankingResponder({ vidA: 20, vidB: 5, vidC: 60 })
   });
 
   const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
@@ -1255,6 +1835,110 @@ test("the card's own comparison is redone from the rebuilt ranking", async () =>
   assert.strictEqual(rows[0].performanceAnalysis, undefined, 'and so is its tooltip');
   assert.strictEqual(rows[1].trend, 'TREND_TYPE_UP', 'a row for another metric keeps its own judgement');
   assert.deepStrictEqual(rows[1].typicalRange.typicalRange, { lowerBound: 1, upperBound: 9 }, 'and its own band');
+});
+
+test('a ranking whose queries fail keeps the order it last had', async () => {
+  // A minute before the hour turns, so that two minutes later every window the
+  // ranking asks about has moved on and nothing it needs is cached.
+  const before = Math.floor(1780000000000 / HOUR) * HOUR + 59 * 60000;
+  const after = before + 2 * 60000;
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidA' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidB' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } },
+    { rank: 3, entity: { videoId: 'vidC' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 100 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: {
+    video: { externalVideoId: 'vidA' },
+    ranking,
+    metricsTable: { metricRows: [{
+      metric: { type: 'EXTERNAL_VIEWS' },
+      value: { double: 900 },
+      trend: 'TREND_TYPE_UP',
+      typicalRange: { typicalRange: { lowerBound: 800, upperBound: 2000 } }
+    }] }
+  } }] };
+
+  let failing = false;
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'list_creator_videos': videoList({ vidA: before - 3 * HOUR, vidB: before - 33 * HOUR, vidC: before - 63 * HOUR }),
+    'yta_web/join': (body) => (failing ? { status: 500, text: 'nope' } : rankingResponder({ vidA: 20, vidB: 5, vidC: 60 })(body))
+  });
+
+  const url = 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json';
+  const first = await at(before, () => request(env, url, screenRequest()));
+  const firstOrder = JSON.parse(first.text).cards[0].entitySnapshotCardData.ranking.entities;
+  assert.deepStrictEqual(firstOrder.map((e) => e.entity.videoId), ['vidC', 'vidA', 'vidB'], 'rebuilt while the queries worked');
+
+  // Both the hourly queries and the totals behind them now fail, and none of
+  // the answers to them fit the windows this card wants, so the whole ranking
+  // is put back together from the figures it last really had.
+  failing = true;
+  const later = await at(after, () => request(env, url, screenRequest()));
+  const card = JSON.parse(later.text).cards[0].entitySnapshotCardData;
+
+  assert.deepStrictEqual(card.ranking.entities.map((e) => e.entity.videoId), ['vidC', 'vidA', 'vidB'], 'the order it last had');
+  assert.deepStrictEqual(card.ranking.entities.map((e) => e.value.double), [60, 20, 5], 'the figures it last had');
+  assert.deepStrictEqual(card.ranking.entities.map((e) => e.rank), [1, 2, 3], 'and the places that go with them');
+  assert.deepStrictEqual(card.metricsTable.metricRows[0].typicalRange.typicalRange, { lowerBound: 13, upperBound: 40 }, 'with the band beside it drawn from the same figures');
+});
+
+test('a ranking is put back together whole rather than one stale figure among fresh ones', async () => {
+  // A ranking's windows are rounded out to whole hours, so the same ten
+  // questions are asked all through an hour. Answering the one that failed
+  // from the memory kept per question would hand the card nine figures from
+  // this minute and one from ten minutes ago, and would keep marking that
+  // mixture as freshly remembered - so the card could go on being rebuilt out
+  // of an old figure indefinitely. The ranking is remembered whole instead.
+  const hour = Math.floor(1780000000000 / HOUR) * HOUR;
+  const first = hour + 10 * 60000;
+  const second = hour + 20 * 60000;
+  const third = first + 16 * 60000;
+
+  // Whole hours apart, so each video's window rounds to the same pair of hours
+  // all through this one: the questions at twenty past really are the same
+  // questions as the ones at ten past.
+  const newest = first - 3 * HOUR;
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidA' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidB' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } },
+    { rank: 3, entity: { videoId: 'vidC' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 100 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidA' }, ranking } }] };
+
+  const engaged = { vidA: 20, vidB: 5, vidC: 60 };
+  let denied = [];
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'list_creator_videos': videoList({ vidA: newest, vidB: newest - 10 * HOUR, vidC: newest - 20 * HOUR }),
+    'yta_web/join': (body) => rankingResponder(engaged, { deny: denied })(body)
+  });
+
+  const url = 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json';
+  const entitiesOf = (result) => JSON.parse(result.text).cards[0].entitySnapshotCardData.ranking.entities;
+
+  const one = entitiesOf(await at(first, () => request(env, url, screenRequest())));
+  assert.deepStrictEqual(one.map((e) => e.entity.videoId), ['vidC', 'vidA', 'vidB'], 'rebuilt while every query answered');
+  assert.deepStrictEqual(one.map((e) => e.value.double), [60, 20, 5]);
+
+  // Ten minutes on, the server will not answer for vidB either by the hour or
+  // as a total - and the other two have gone on gathering views.
+  denied = ['vidB'];
+  engaged.vidA = 200;
+  engaged.vidC = 600;
+  const two = entitiesOf(await at(second, () => request(env, url, screenRequest())));
+
+  assert.deepStrictEqual(two.map((e) => e.entity.videoId), ['vidC', 'vidA', 'vidB'], 'the order it last had');
+  assert.deepStrictEqual(two.map((e) => e.value.double), [60, 20, 5],
+    'every figure out of the one list it remembered, not this minute\'s answers for the two that did reply');
+  assert.deepStrictEqual(two.map((e) => e.rank), [1, 2, 3], 'and the places that go with them');
+
+  // Sixteen minutes after the figures were really gathered. Putting the
+  // remembered ones back must not have made them look any newer than they are,
+  // or the card would keep showing them for as long as vidB went on failing.
+  const three = entitiesOf(await at(third, () => request(env, url, screenRequest())));
+  assert.deepStrictEqual(three.map((e) => e.entity.videoId), ['vidA', 'vidB', 'vidC'], 'left exactly as the server sent it');
+  assert.deepStrictEqual(three.map((e) => e.value.double), [900, 500, 100], 'showing raw views rather than figures a quarter of an hour old');
 });
 
 test("a dashboard column the swapped query already answered is not asked again", async () => {

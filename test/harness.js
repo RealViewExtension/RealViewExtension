@@ -129,12 +129,21 @@ function createEnvironment(routes, options = {}) {
     String
   };
 
+  // The interceptor is loaded as a function body, so its timers are whatever
+  // is passed in here: a test watching something scheduled a minute out can
+  // hand over a clock of its own rather than waiting a minute.
+  const timers = options.timers || {};
+
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'interceptor.js'), 'utf8');
   const load = new Function(
     'window', 'document', 'location', 'XMLHttpRequest', 'Event', 'ProgressEvent', 'console',
+    'setTimeout', 'clearTimeout',
     source
   );
-  load(sandbox.window, sandbox.document, sandbox.location, FakeXHR, Event, ProgressEvent, console);
+  load(
+    sandbox.window, sandbox.document, sandbox.location, FakeXHR, Event, ProgressEvent, console,
+    timers.setTimeout || setTimeout, timers.clearTimeout || clearTimeout
+  );
 
   return { FakeXHR, sent, attributes, Event, ProgressEvent };
 }
