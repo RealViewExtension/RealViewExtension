@@ -1,5 +1,14 @@
 [
   {
+    "version": "1.7.4",
+    "date": "2026-09-11",
+    "changes": [
+      "After an update, a small card appears in the corner of Studio once, lists what changed, and slides away after a few seconds or when you close it.",
+      "Closing that card clears the red 1 on the toolbar icon, the same as opening the popup does.",
+      "A new \"Update notice on Studio\" switch in the popup turns the card off; the badge on the icon still appears either way."
+    ]
+  },
+  {
     "version": "1.6.4",
     "date": "2026-09-11",
     "changes": [

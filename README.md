@@ -35,17 +35,23 @@ point: it leaves out people who clicked away within the first few seconds.
 ### Turning it on and off
 
 Click the RealView icon in the Chrome toolbar. You may need to click the puzzle-piece icon first
-and pin RealView to see it. The popup has three switches:
+and pin RealView to see it. The popup has four switches:
 
 - **Use engaged views** — the main switch. Turn it off and Studio behaves exactly as it normally
   does.
 - **Red charts** — the graph colour. It only applies while engaged views are being shown; with
   the switch above turned off the graphs go back to YouTube's own blue.
+- **Update notice on Studio** — the small card that appears in the corner of Studio once after an
+  update. Turn it off and only the toolbar badge says there is something new.
 - **Log to the console** — for diagnosing a problem. Leave it off for normal use.
 
-After RealView updates itself, a small red **1** appears on the toolbar icon. Open the popup and
-it shows what changed in that version, then the badge clears. Nothing opens on its own: no tab, no
-notification, no page — the badge is the only thing that ever asks for your attention.
+After RealView updates itself, a small red **1** appears on the toolbar icon, and the next time you
+open Studio a small card in the bottom corner says what changed. The card slides away on its own
+after a few seconds, or sooner if you close it. Closing it clears the badge, exactly as opening the
+popup does, while a card that went away by itself leaves the badge where it is, so the popup still
+has the list for you to read later. If you would rather not see the card at all, turn **Update
+notice on Studio** off and the badge alone will tell you. Nothing opens on its own: no tab, no
+notification, no page.
 
 ### Things worth knowing
 
@@ -336,8 +342,9 @@ Any subset of those names is left entirely alone until you set it back to `''`.
 | `bridge.js` | isolated world | Mirrors saved settings onto `<html>` |
 | `relabel.js` | isolated world | Corrects the wording Studio writes itself |
 | `charts.css` | isolated world | Paints the charts red |
-| `popup.html` / `popup.js` | popup | Three switches, stored in `chrome.storage.sync`, and the what's-new section |
-| `background.js` | service worker | Marks an update unread and puts the badge on the icon |
+| `toast.js` | content script | The once-per-update card in Studio's corner |
+| `popup.html` / `popup.js` | popup | Four switches, stored in `chrome.storage.sync`, and the what's-new section |
+| `background.js` | service worker | Marks an update unread, puts the badge on the icon, and answers the card's two messages |
 | `changelog.json` | popup | What changed in each version, newest first |
 
 Developers can point **Load unpacked** at this repository's `src` directory instead of the
@@ -361,7 +368,10 @@ version, a real date and some plain-English changes, the entries run newest firs
 twice — and that the newest entry is the version in `manifest.json`, which is what fails when a
 release bumps the version and forgets to say what changed. It also loads `src/background.js` with a
 fake Chrome and checks what an update, a second update nobody read, a fresh install and a browser
-restart each do to the badge.
+restart each do to the badge, along with the answers it gives the card's two messages: which entry
+it hands over, that it hands it over only once per version, that the switch and a read changelog
+both keep it quiet, that closing the card clears the badge, and that a message meant for somebody
+else is left unanswered.
 
 ### Releasing
 
