@@ -1,5 +1,5 @@
 # RealView
-(pending Google Extension Store Review)
+Chrome Web Store: https://chromewebstore.google.com/detail/realview-engaged-views-fo/nagdbmdfcaofcfgmaflmflbcbbfdddjo
 
 
 A Chrome extension that makes YouTube Studio show **engaged views** — the older definition of a
