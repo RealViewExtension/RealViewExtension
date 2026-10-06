@@ -1470,6 +1470,18 @@
     });
   }
 
+  // The same lookup names each video, for the copy of the ranking drawn on the
+  // dashboard. Titles can change, so a later answer replaces an earlier one.
+  var videoTitles = new Map();
+
+  function rememberTitles(titles) {
+    Object.keys(titles).forEach(function (id) {
+      videoTitles.delete(id);
+      videoTitles.set(id, titles[id]);
+      if (videoTitles.size > PUBLISH_CACHE_LIMIT) videoTitles.delete(videoTitles.keys().next().value);
+    });
+  }
+
   // The ranking compares each video over the same stretch of its own life, so
   // every entry needs the moment its video went up. Studio's own video list
   // carries that, asked for with a mask narrow enough to keep the reply small.
@@ -1504,7 +1516,7 @@
       filter: { and: { operands: [{ channelIdIs: { value: ctx.channelId } }] } },
       order: 'VIDEO_ORDER_DISPLAY_TIME_DESC',
       pageSize: RANKING_LOOKUP_SIZE,
-      mask: { videoId: true, timePublishedSeconds: true },
+      mask: { videoId: true, timePublishedSeconds: true, title: true },
       context: ctx.context
     };
 
@@ -1525,7 +1537,9 @@
         try {
           var parsed = JSON.parse(xhr.responseText);
           var times = {};
+          var titles = {};
           (parsed.videos || []).forEach(function (video) {
+            if (video && video.videoId && typeof video.title === 'string') titles[video.videoId] = video.title;
             // A video that has not gone up yet reports a publish time of "0".
             // It has no life to measure, so it is left undated deliberately and
             // the ranking it appears in is left exactly as the server sent it.
@@ -1534,6 +1548,7 @@
             }
           });
           rememberPublishTimes(times);
+          rememberTitles(titles);
           finish(merged(times));
         } catch (e) { finish(null); }
       };
@@ -1628,6 +1643,33 @@
     return { at: kept.at, figures: ids.map(function (id) { return kept.figures[kept.ids.indexOf(id)]; }) };
   }
 
+  // Studio only shows the whole ranking in a panel opened from the card, and
+  // that panel will not open on a phone. Once the ranking holds engaged
+  // figures it is handed to the dashboard script, which draws it as a card of
+  // its own. The page is noted so a ranking from a video's analytics screen is
+  // never drawn on the dashboard, and a list missing a title is not handed
+  // over at all rather than drawn with a gap in it.
+  function publishRanking(ranking, holder) {
+    var primary = holder && holder.video && holder.video.externalVideoId;
+    if (!primary) return;
+    var rows = [];
+    var newest = 0;
+    for (var i = 0; i < ranking.entities.length; i++) {
+      var item = ranking.entities[i];
+      var id = item.entity.videoId;
+      var title = videoTitles.get(id);
+      if (typeof title !== 'string') { log('ranking not drawn on the dashboard, a video has no title'); return; }
+      if (publishTimes.has(id)) newest = Math.max(newest, publishTimes.get(id));
+      rows.push({ id: id, rank: item.rank, value: item.value.double, title: title });
+    }
+    document.documentElement.setAttribute('data-realview-ranking', JSON.stringify({
+      path: location.pathname,
+      video: primary,
+      spanMs: newest ? Math.max(0, Date.now() - newest) : null,
+      rows: rows
+    }));
+  }
+
   function convertRanking(ranking, holder, ctx) {
     var ids = ranking.entities.map(function (item) { return item.entity.videoId; });
     // The card can take three rounds - the video list, the hourly queries, and
@@ -1652,6 +1694,7 @@
         ranking.entities.sort(function (a, b) { return b.value.double - a.value.double; });
         ranking.entities.forEach(function (item) { item.rank = placeOf(item.value.double, figures); });
         applySnapshotComparison(holder, ids, figures);
+        publishRanking(ranking, holder);
 
         // Putting remembered figures back must not make them look any newer
         // than they are, or a card could go on repeating them indefinitely.

@@ -1,5 +1,14 @@
 [
   {
+    "version": "1.8.4",
+    "date": "2026-10-06",
+    "changes": [
+      "The channel dashboard now has a \"Top recent videos\" card listing the ten videos your latest upload is ranked against, with their engaged views, so the list can be seen without opening the ranking. This works on a phone, where the ranking panel will not open.",
+      "Tapping a video in that card opens its analytics.",
+      "A new \"Top recent videos on the dashboard\" switch in the popup turns the card off."
+    ]
+  },
+  {
     "version": "1.7.4",
     "date": "2026-09-11",
     "changes": [

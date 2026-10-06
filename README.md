@@ -35,12 +35,14 @@ point: it leaves out people who clicked away within the first few seconds.
 ### Turning it on and off
 
 Click the RealView icon in the Chrome toolbar. You may need to click the puzzle-piece icon first
-and pin RealView to see it. The popup has four switches:
+and pin RealView to see it. The popup has five switches:
 
 - **Use engaged views** — the main switch. Turn it off and Studio behaves exactly as it normally
   does.
 - **Red charts** — the graph colour. It only applies while engaged views are being shown; with
   the switch above turned off the graphs go back to YouTube's own blue.
+- **Top recent videos on the dashboard** — the card listing the ten videos the latest upload is
+  ranked against. It also needs engaged views to be on.
 - **Update notice on Studio** — the small card that appears in the corner of Studio once after an
   update. Turn it off and only the toolbar badge says there is something new.
 - **Log to the console** — for diagnosing a problem. Leave it off for normal use.
@@ -133,6 +135,15 @@ On the channel this was built against the difference is real: over 365 days the 
   figure lands in it. If the verdict changes, the sentence the server wrote for the old one
   ("Looking good! This video is performing as usual") is dropped rather than left to contradict
   the arrow. A row the server did not judge is left unjudged.
+
+  Studio only shows the full list in a panel opened from the "9 of 10" row, and that panel will
+  not open on a phone. So once the ranking is engaged, RealView also draws it on the channel
+  dashboard as a **Top recent videos** card, in the same column as the latest-video card: the
+  span the videos are measured over, then each video's place, thumbnail, title and engaged
+  views, with the latest upload highlighted. Tapping a video opens its analytics. The titles come
+  from the same video list lookup that dates the videos. The card is only drawn from a ranking
+  that was fully rebuilt (or remembered from one that was), never from raw figures, and if the
+  latest-video card cannot be found on the page the dashboard is left as Studio drew it.
 
 Any card that mentions views and had nothing converted inside it is taken at its word, and the
 wording on that screen is left as Studio wrote it.
@@ -347,7 +358,8 @@ Any subset of those names is left entirely alone until you set it back to `''`.
 | `relabel.js` | isolated world | Corrects the wording Studio writes itself |
 | `charts.css` | isolated world | Paints the charts red |
 | `toast.js` | content script | The once-per-update card in Studio's corner |
-| `popup.html` / `popup.js` | popup | Four switches, stored in `chrome.storage.sync`, and the what's-new section |
+| `topvideos.js` | content script | The "Top recent videos" card on the channel dashboard |
+| `popup.html` / `popup.js` | popup | Five switches, stored in `chrome.storage.sync`, and the what's-new section |
 | `background.js` | service worker | Marks an update unread, puts the badge on the icon, and answers the card's two messages |
 | `changelog.json` | popup | What changed in each version, newest first |
 
