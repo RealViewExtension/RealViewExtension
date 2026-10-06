@@ -135,29 +135,58 @@
     return !colour || colour === 'transparent' || /rgba\(.*,\s*0\)$/.test(colour);
   }
 
+  function looksLikeCard(el) {
+    var style = getComputedStyle(el);
+    var bordered = parseFloat(style.borderTopWidth) > 0 && style.borderTopStyle !== 'none';
+    var shadowed = style.boxShadow && style.boxShadow !== 'none';
+    var filled = !transparent(style.backgroundColor) && parseFloat(style.borderTopLeftRadius) > 0;
+    return bordered || shadowed || filled;
+  }
+
   // A card has an edge: a border, a shadow, or a filled and rounded background.
-  // Studio sometimes puts that on the element itself and sometimes on the one
-  // element filling it, so both are checked. The element whose style makes it
-  // a card is returned, so the copy can borrow the same look.
+  // Studio puts that edge a few wrappers inside the element stacked in the
+  // column (ytcd-card, then a badge wrapper, then ytcd-basic-card), so the
+  // search goes down through whichever child fills the same box. The element
+  // carrying the edge is returned, so the copy can borrow the same look.
+  var SURFACE_DEPTH = 4;
+
   function cardSurface(el) {
-    var candidates = [el];
-    var only = el.children.length === 1 ? el.children[0] : null;
-    if (only) candidates.push(only);
-    for (var i = 0; i < candidates.length; i++) {
-      var style = getComputedStyle(candidates[i]);
-      var bordered = parseFloat(style.borderTopWidth) > 0 && style.borderTopStyle !== 'none';
-      var shadowed = style.boxShadow && style.boxShadow !== 'none';
-      var filled = !transparent(style.backgroundColor) && parseFloat(style.borderTopLeftRadius) > 0;
-      if (bordered || shadowed || filled) return candidates[i];
+    var current = el;
+    for (var depth = 0; current && depth <= SURFACE_DEPTH; depth++) {
+      if (looksLikeCard(current)) return current;
+      var rect = current.getBoundingClientRect();
+      var filling = null;
+      for (var i = 0; i < current.children.length && !filling; i++) {
+        var box = current.children[i].getBoundingClientRect();
+        if (box.height > 0 && Math.abs(box.width - rect.width) <= 2 && Math.abs(box.top - rect.top) <= 2) {
+          filling = current.children[i];
+        }
+      }
+      current = filling;
     }
     return null;
   }
 
-  // The card holding the anchor is the first ancestor that looks like a card
-  // and is stacked above or below another card of the same width: that other
-  // card is its neighbour in the column. Sections inside the card fail one test
-  // or the other, and so do the columns themselves, which sit side by side.
+  // Studio's own names, when they are there: each card is a ytcd-card stacked
+  // in a ytcd-card-column.
+  function studioCard(from) {
+    for (var el = from; el && el !== document.body; el = parentOf(el)) {
+      var parent = parentOf(el);
+      if (el.tagName === 'YTCD-CARD' && parent && parent.tagName === 'YTCD-CARD-COLUMN') {
+        return { card: el, surface: cardSurface(el) || el, column: parent };
+      }
+    }
+    return null;
+  }
+
+  // Otherwise the card holding the anchor is the first ancestor that looks
+  // like a card and is stacked above or below another card of the same width:
+  // that other card is its neighbour in the column. Sections inside the card
+  // fail one test or the other, and so do the columns themselves, which sit
+  // side by side.
   function findCard(from) {
+    var named = studioCard(from);
+    if (named) return named;
     for (var el = from; el && el !== document.body; el = parentOf(el)) {
       var parent = parentOf(el);
       if (!parent) return null;
