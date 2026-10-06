@@ -9,7 +9,7 @@
 (function () {
   'use strict';
 
-  var DEFAULTS = { rewrite: true, color: true, debug: false, skip: '' };
+  var DEFAULTS = { rewrite: true, color: true, topVideos: true, debug: false, skip: '' };
 
   function apply(settings) {
     var root = document.documentElement;
@@ -20,6 +20,7 @@
     var red = converting && settings.color !== false;
     root.setAttribute('data-realview-rewrite', converting ? 'on' : 'off');
     root.setAttribute('data-realview-color', red ? 'on' : 'off');
+    root.setAttribute('data-realview-top-videos', settings.topVideos === false ? 'off' : 'on');
     root.setAttribute('data-realview-debug', settings.debug === true ? 'on' : 'off');
     root.setAttribute('data-realview-skip', settings.skip || '');
   }

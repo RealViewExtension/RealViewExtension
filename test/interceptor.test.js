@@ -1524,6 +1524,64 @@ test('videos share a place when their figures tie', async () => {
   assert.deepStrictEqual(entities.map((e) => e.rank), [1, 2, 2], 'the two tied videos share second place');
 });
 
+// The dashboard draws the ranking as a card of its own, because Studio's panel
+// listing it will not open on a phone. It is handed over with each video's
+// title from the same lookup that dates them.
+test('a rebuilt ranking is handed to the dashboard with its titles', async () => {
+  const now = Date.now();
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidA' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidB' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidA' }, ranking } }] };
+  const titles = { vidA: 'Newest upload', vidB: 'Older upload' };
+
+  const lookups = [];
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'list_creator_videos': (body) => {
+      lookups.push(JSON.parse(body));
+      return { status: 200, text: JSON.stringify({ videos: [
+        { videoId: 'vidA', title: titles.vidA, timePublishedSeconds: String(Math.floor((now - 3 * HOUR) / 1000)) },
+        { videoId: 'vidB', title: titles.vidB, timePublishedSeconds: String(Math.floor((now - 30 * HOUR) / 1000)) }
+      ] }) };
+    },
+    'yta_web/join': rankingResponder({ vidA: 20, vidB: 50 })
+  });
+
+  await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+
+  assert.strictEqual(lookups[0].mask.title, true, 'the lookup asks for titles as well as publish times');
+  const published = JSON.parse(env.attributes['data-realview-ranking']);
+  assert.strictEqual(published.video, 'vidA', 'it names the video the card is about');
+  assert.strictEqual(published.path, '/', 'and the page it came from');
+  assert.deepStrictEqual(published.rows, [
+    { id: 'vidB', rank: 1, value: 50, title: 'Older upload' },
+    { id: 'vidA', rank: 2, value: 20, title: 'Newest upload' }
+  ], 'in engaged order, with engaged figures and titles');
+  assert.ok(Math.abs(published.spanMs - 3 * HOUR) < 60000, 'measured over the newest video\'s life so far');
+});
+
+test('a ranking with an untitled video is not handed to the dashboard', async () => {
+  const now = Date.now();
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidA' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidB' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidA' }, ranking } }] };
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'list_creator_videos': videoList({ vidA: now - 3 * HOUR, vidB: now - 30 * HOUR }),
+    'yta_web/join': rankingResponder({ vidA: 20, vidB: 50 })
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const entities = JSON.parse(result.text).cards[0].entitySnapshotCardData.ranking.entities;
+  assert.deepStrictEqual(entities.map((e) => e.value.double), [50, 20], 'the ranking itself is still rebuilt');
+  assert.strictEqual(env.attributes['data-realview-ranking'], undefined, 'but no list with a gap in it is drawn');
+});
+
 test('a ranking is left alone when a video cannot be dated', async () => {
   const ranking = { entities: [
     { rank: 1, entity: { videoId: 'vidA' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },

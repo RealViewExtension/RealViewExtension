@@ -1,25 +1,30 @@
 (function () {
   'use strict';
 
-  var DEFAULTS = { rewrite: true, color: true, toast: true, debug: false };
+  var DEFAULTS = { rewrite: true, color: true, topVideos: true, toast: true, debug: false };
   var inputs = {
     rewrite: document.getElementById('rewrite'),
     color: document.getElementById('color'),
+    topVideos: document.getElementById('top-videos'),
     toast: document.getElementById('toast'),
     debug: document.getElementById('debug')
   };
 
-  // The chart colour only means anything while the figures are being converted,
-  // so the switch follows the main one rather than standing on its own.
+  // The chart colour and the dashboard card only mean anything while the
+  // figures are being converted, so their switches follow the main one rather
+  // than standing on their own.
   function reflectDependency() {
     var converting = inputs.rewrite.checked;
-    inputs.color.disabled = !converting;
-    inputs.color.closest('.row').classList.toggle('disabled', !converting);
+    [inputs.color, inputs.topVideos].forEach(function (input) {
+      input.disabled = !converting;
+      input.closest('.row').classList.toggle('disabled', !converting);
+    });
   }
 
   chrome.storage.sync.get(DEFAULTS, function (stored) {
     inputs.rewrite.checked = stored.rewrite !== false;
     inputs.color.checked = stored.color !== false;
+    inputs.topVideos.checked = stored.topVideos !== false;
     // The update card says nothing about views, so it stands on its own rather
     // than following the main switch the way the chart colour does.
     inputs.toast.checked = stored.toast !== false;
@@ -32,6 +37,7 @@
     chrome.storage.sync.set({
       rewrite: inputs.rewrite.checked,
       color: inputs.color.checked,
+      topVideos: inputs.topVideos.checked,
       toast: inputs.toast.checked,
       debug: inputs.debug.checked
     });
