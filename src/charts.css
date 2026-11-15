@@ -58,3 +58,31 @@ html[data-realview-color="on"] [fill="rgba(65, 180, 217, 1)"] {
 html[data-realview-color="on"] [fill="rgba(65, 180, 217, 0.1)"] {
   fill: rgba(255, 0, 51, 0.12) !important;
 }
+
+/* The same blue in the other forms a chart library may write it: as rgb() or
+   hex, without spaces, or in an inline style rather than an attribute. */
+html[data-realview-color="on"] [stroke="rgb(65, 180, 217)"],
+html[data-realview-color="on"] [stroke="rgba(65,180,217,1)"],
+html[data-realview-color="on"] [stroke="rgb(65,180,217)"],
+html[data-realview-color="on"] [stroke="#41b4d9"],
+html[data-realview-color="on"] [stroke="#41B4D9"] {
+  stroke: #ff0033 !important;
+}
+
+html[data-realview-color="on"] [fill="rgb(65, 180, 217)"],
+html[data-realview-color="on"] [fill="rgba(65,180,217,1)"],
+html[data-realview-color="on"] [fill="rgb(65,180,217)"],
+html[data-realview-color="on"] [fill="#41b4d9"],
+html[data-realview-color="on"] [fill="#41B4D9"] {
+  fill: #ff0033 !important;
+}
+
+html[data-realview-color="on"] [style*="stroke: rgb(65, 180, 217)"],
+html[data-realview-color="on"] [style*="stroke:rgb(65, 180, 217)"] {
+  stroke: #ff0033 !important;
+}
+
+html[data-realview-color="on"] [style*="fill: rgb(65, 180, 217)"],
+html[data-realview-color="on"] [style*="fill:rgb(65, 180, 217)"] {
+  fill: #ff0033 !important;
+}

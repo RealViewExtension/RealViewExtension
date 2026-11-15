@@ -559,11 +559,19 @@
 
     // The realtime card covers the last 48 hours rather than the screen's
     // period, and the video table inside it covers those same hours, so a table
-    // is tagged with the card it belongs to.
-    function walk(node, depth, realtime, contentType) {
+    // is tagged with the card it belongs to. The card's name is not relied on
+    // alone: each table also remembers the path that led to it and how far down
+    // that path its card began, so that afterwards it can be matched with the
+    // timestamp chart nearest to it, and a chart in the same card makes the
+    // table realtime whatever the card is called.
+    var chains = [];
+    var stack = [];
+    function walk(node, depth, realtime, contentType, cardIndex) {
       if (depth > 14 || node === null || typeof node !== 'object') return;
+      stack.push(node);
       if (Array.isArray(node)) {
-        for (var i = 0; i < node.length; i++) walk(node[i], depth + 1, realtime, contentType);
+        for (var i = 0; i < node.length; i++) walk(node[i], depth + 1, realtime, contentType, cardIndex);
+        stack.pop();
         return;
       }
 
@@ -618,17 +626,59 @@
           var column = node.metricColumns[c];
           if (column && column.metric && column.metric.type === SOURCE_METRIC && (column.counts || column.percentages)) {
             tables.push({ table: node, column: column, realtime: realtime, contentType: contentType });
+            chains.push({ path: stack.slice(), cardIndex: cardIndex });
           }
         }
       }
       var keys = Object.keys(node);
       for (var k = 0; k < keys.length; k++) {
-        walk(node[keys[k]], depth + 1, realtime || keys[k] === 'latestActivityCardData', contentType);
+        // The value under a card's key is the next thing pushed, so its place
+        // on the path is the path's current length.
+        walk(node[keys[k]], depth + 1, realtime || keys[k] === 'latestActivityCardData', contentType,
+          /CardData$/.test(keys[k]) ? stack.length : cardIndex);
       }
+      stack.pop();
     }
 
-    walk(payload, 0, false, null);
+    walk(payload, 0, false, null, -1);
+    nearestWindows(tables, chains);
     return { headline: headline, tables: tables, headers: headers, entities: entities, rankings: rankings };
+  }
+
+  // A table beside a timestamp chart usually covers the chart's window, so each
+  // table learns the window of the chart it sits closest to: the one it shares
+  // the deepest container with. That chart only makes the table realtime when
+  // the container they share lies inside the table's own card. A chart in some
+  // other card, or a payload with no cards at all, says nothing about the
+  // table, which then goes on following the screen's period. The paths are
+  // kept apart from the entries and dropped here, so nothing of them can reach
+  // a payload that is written back out.
+  function nearestWindows(tables, chains) {
+    var charts = [];
+    tables.forEach(function (entry, index) {
+      var dimension = tableDimension(entry.table);
+      if (!dimension || !dimension.timestamps || !dimension.labels || !dimension.labels.length) return;
+      charts.push({ path: chains[index].path, range: timestampRange(dimension.labels) });
+    });
+    if (!charts.length) return;
+
+    tables.forEach(function (entry, index) {
+      var path = chains[index].path;
+      var best = null;
+      var bestShared = -1;
+      charts.forEach(function (chart) {
+        var shared = -1;
+        var limit = Math.min(path.length, chart.path.length);
+        while (shared + 1 < limit && path[shared + 1] === chart.path[shared + 1]) shared++;
+        // A later chart wins a tie, as the last one did when there was only a
+        // single window for the whole payload.
+        if (shared >= bestShared) { bestShared = shared; best = chart; }
+      });
+      if (!best || bestShared < 0) return;
+      entry.window = best.range;
+      var cardIndex = chains[index].cardIndex;
+      if (cardIndex >= 0 && bestShared >= cardIndex) entry.realtime = true;
+    });
   }
 
   // The gap between the first two buckets gives the granularity, so an hourly
@@ -783,6 +833,14 @@
 
   /* --------------------------------------------------------- conversion */
 
+  // A realtime table follows the window of the chart beside it; any other
+  // follows the screen's period, and borrows a chart's window only when the
+  // screen has no period to give.
+  function tableRange(entry, ctx, hourlyRange) {
+    if (entry.realtime) return entry.window || hourlyRange;
+    return ctx.range || entry.window || hourlyRange;
+  }
+
   // Describes every query an analytics payload needs, so they can all be asked
   // for at once.
   function planConversion(payload, ctx) {
@@ -791,8 +849,10 @@
     var plans = [];
 
     // The realtime card states its own window through the hours it charts, and
-    // the video table beside it covers those same hours. A payload that carries
-    // no screen period at all therefore still has a range to work from.
+    // the video table beside it covers those same hours, so each table already
+    // carries the window of the chart nearest to it. This last chart's window
+    // is what is left when a table has none of its own, so a payload that
+    // carries no screen period at all still has a range to work from.
     var hourlyRange = null;
     found.tables.forEach(function (entry) {
       var dimension = tableDimension(entry.table);
@@ -887,7 +947,7 @@
 
       var hierarchy = sourceHierarchy(entry.table);
       if (hierarchy) {
-        var pairRange = entry.realtime ? hourlyRange : (ctx.range || hourlyRange);
+        var pairRange = tableRange(entry, ctx, hourlyRange);
         if (!pairRange) return;
 
         var typeKey = 'rv_pairs_' + index + '_type';
@@ -925,7 +985,7 @@
 
       var described = tableDimensions(entry.table);
       if (described && described.length > 1) {
-        var wideRange = entry.realtime ? hourlyRange : (ctx.range || hourlyRange);
+        var wideRange = tableRange(entry, ctx, hourlyRange);
         if (!wideRange) return;
         // A two-way table has as many rows as the pairings that occurred, so
         // the page has to be asked for large enough to hold all of them.
@@ -960,7 +1020,7 @@
       // buckets it draws, everything else follows the screen's period.
       // A realtime table follows the hours its card draws; everything else
       // follows the period the screen was asked for.
-      var range = entry.realtime ? hourlyRange : (ctx.range || hourlyRange);
+      var range = tableRange(entry, ctx, hourlyRange);
       if (dimension.timestamps && dimension.labels.length) range = timestampRange(dimension.labels);
       if (!range) return;
 
@@ -1433,7 +1493,20 @@
     return changed;
   }
 
+  // Names the cards a response carries, so a card Studio has started sending
+  // under a new name shows up in the console when the debug switch is on.
+  function logCards(payload) {
+    if (!debugEnabled() || !payload || !Array.isArray(payload.cards)) return;
+    var names = [];
+    payload.cards.forEach(function (card) {
+      if (!card || typeof card !== 'object' || card.isHidden) return;
+      Object.keys(card).forEach(function (key) { if (/CardData$/.test(key)) names.push(key); });
+    });
+    log('cards: ' + names.join(', '));
+  }
+
   function convertAnalytics(payload, ctx) {
+    logCards(payload);
     var plan = planConversion(payload, ctx);
     if (plan.nodes.length === 0 && plan.found.rankings.length === 0) return Promise.resolve(false);
 
@@ -2474,7 +2547,55 @@
 
     if (isVideoListUrl(url) && !skipped('videos')) return proxy(xhr, body, null, videoListConverter);
 
+    logUnhandled(url);
     return nativeSend.apply(xhr, args);
+  }
+
+  /* ---------------------------------------------------------- diagnostics */
+
+  // A Studio update can move a screen to an address this extension does not
+  // know, or to fetch, which it does not read. Either way the figures stay raw
+  // with nothing to say why, so with the debug switch on each such address is
+  // named once in the console.
+  var STUDIO_API_PATHS = ['/youtubei/v1/yta_web/', '/youtubei/v1/creator/'];
+  var unhandledSeen = {};
+  var fetchSeen = {};
+
+  function studioApiPath(url) {
+    var text = String(url || '');
+    var matched = STUDIO_API_PATHS.some(function (path) { return text.indexOf(path) !== -1; });
+    if (!matched) return null;
+    var path = text.split('?')[0].split('#')[0];
+    var scheme = path.indexOf('://');
+    if (scheme !== -1) {
+      var slash = path.indexOf('/', scheme + 3);
+      path = slash === -1 ? '/' : path.slice(slash);
+    }
+    return path;
+  }
+
+  function logUnhandled(url) {
+    if (!debugEnabled()) return;
+    var path = studioApiPath(url);
+    if (!path || unhandledSeen[path]) return;
+    unhandledSeen[path] = true;
+    log('not handled: ' + path);
+  }
+
+  // Only watched, never patched: fetch is left exactly as Studio found it.
+  if (typeof PerformanceObserver === 'function') {
+    try {
+      new PerformanceObserver(function (list) {
+        if (!debugEnabled()) return;
+        list.getEntries().forEach(function (entry) {
+          if (entry.initiatorType !== 'fetch') return;
+          var path = studioApiPath(entry.name);
+          if (!path || fetchSeen[path]) return;
+          fetchSeen[path] = true;
+          log('requested with fetch, which RealView does not read: ' + path);
+        });
+      }).observe({ type: 'resource', buffered: true });
+    } catch (e) { /* an observer is a convenience; without one nothing is lost */ }
   }
 
 })();
