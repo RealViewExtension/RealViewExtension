@@ -35,7 +35,7 @@
 
   function active() {
     var path = location.pathname;
-    if (/\/analytics(\/|$)/.test(path)) return converted('analytics');
+    if (/\/(analytics|insights)(\/|$)/.test(path)) return converted('analytics');
     if (/^\/channel\/[^/]+\/?$/.test(path)) return converted('dashboard');
     if (/\/(videos|playlists|podcasts)(\/|$)/.test(path)) return converted('videolist');
     return false;

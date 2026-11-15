@@ -2161,6 +2161,153 @@ test('a sparkline over time is still left alone', async () => {
   assert.deepStrictEqual(column.counts.values, [3, 4], 'left as it was');
 });
 
+// Buckets ending at the current hour or minute, oldest first.
+function buckets(count, size) {
+  const base = Math.floor(Date.now() / size) * size - (count - 1) * size;
+  const values = [];
+  for (let i = 0; i < count; i++) values.push(base + i * size);
+  return values;
+}
+
+function chartTable(type, timestamps) {
+  return {
+    dimensionColumns: [{ dimension: { type }, timestamps: { values: timestamps } }],
+    metricColumns: [{ metric: { type: 'EXTERNAL_VIEWS' }, counts: { values: timestamps.map(() => 1) } }]
+  };
+}
+
+function videoTable(ids) {
+  return {
+    dimensionColumns: [{ dimension: { type: 'VIDEO' }, strings: { values: ids } }],
+    metricColumns: [{ metric: { type: 'EXTERNAL_VIEWS' }, counts: { values: ids.map(() => 50) } }]
+  };
+}
+
+function fourWeekCardsRequest() {
+  return JSON.stringify({
+    context: {},
+    screenConfig: { entity: { channelId: CHANNEL }, timePeriod: { timePeriodType: 'ANALYTICS_TIME_PERIOD_TYPE_FOUR_WEEKS' }, currency: 'CAD', timeZoneOffsetSecs: OFFSET },
+    cardConfigs: []
+  });
+}
+
+// Every query the extension asked, and the one for a given video's table.
+function recordingResponder(queries, perLabel) {
+  return (body) => {
+    JSON.parse(body).nodes.forEach((node) => queries.push(node.value.query));
+    return joinResponder(perLabel)(body);
+  };
+}
+
+function videoQueryFor(queries, id) {
+  return queries.find((q) => q.dimensions[0] && q.dimensions[0].type === 'VIDEO' &&
+    q.restricts.some((r) => r.dimension.type === 'VIDEO' && r.inValues.indexOf(id) !== -1));
+}
+
+function hoursSpanned(query) {
+  const range = query.timeRange.unixTimeRange;
+  return (Number(range.exclusiveEnd) - Number(range.inclusiveStart)) / 3600;
+}
+
+test('a realtime card under an unfamiliar name still asks for its table over the hours it charts', async () => {
+  const queries = [];
+  const timestamps = buckets(48, HOUR);
+  const env = createEnvironment({
+    'get_cards': JSON.stringify({
+      cards: [{
+        realtimeActivityCardData: {
+          datas: [{
+            timePeriod: 'ANALYTICS_TIME_PERIOD_TYPE_REALTIME_LAST_48_HOURS',
+            mainChartData: chartTable('HOUR', timestamps),
+            topEntitiesData: videoTable(['vidA', 'vidB'])
+          }]
+        }
+      }]
+    }),
+    'yta_web/join': recordingResponder(queries, { vidA: 5, vidB: 1 })
+  });
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_cards?alt=json', fourWeekCardsRequest());
+
+  const videoQuery = videoQueryFor(queries, 'vidA');
+  assert.ok(videoQuery, 'the video table was queried');
+  assert.ok(videoQuery.timeRange.unixTimeRange, 'over an hourly window rather than the 28 day period');
+  assert.strictEqual(hoursSpanned(videoQuery), 48, 'exactly the 48 hours the chart draws');
+
+  const top = JSON.parse(result.text).cards[0].realtimeActivityCardData.datas[0].topEntitiesData.metricColumns[0];
+  assert.deepStrictEqual(top.counts.values, [5, 1], 'and the card shows those hours');
+});
+
+test('two realtime charts in one card each lend their own window to the table beside them', async () => {
+  const queries = [];
+  const env = createEnvironment({
+    'get_cards': JSON.stringify({
+      cards: [{
+        latestActivityCardData: {
+          datas: [
+            {
+              timePeriod: 'ANALYTICS_TIME_PERIOD_TYPE_REALTIME_LAST_48_HOURS',
+              mainChartData: chartTable('HOUR', buckets(48, HOUR)),
+              topEntitiesData: videoTable(['vidA', 'vidB'])
+            },
+            {
+              timePeriod: 'ANALYTICS_TIME_PERIOD_TYPE_REALTIME_LAST_60_MINUTES',
+              mainChartData: chartTable('MINUTE', buckets(60, 60000)),
+              topEntitiesData: videoTable(['vidC', 'vidD'])
+            }
+          ]
+        }
+      }]
+    }),
+    'yta_web/join': recordingResponder(queries, { vidA: 5, vidB: 1, vidC: 2, vidD: 4 })
+  });
+  await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_cards?alt=json', fourWeekCardsRequest());
+
+  const hourly = videoQueryFor(queries, 'vidA');
+  const minutely = videoQueryFor(queries, 'vidC');
+  assert.ok(hourly && minutely, 'both video tables were queried');
+  assert.ok(hourly !== minutely, 'each with a query of its own');
+  assert.strictEqual(hoursSpanned(hourly), 48, 'the first table spans its chart\'s 48 hours');
+  assert.strictEqual(hoursSpanned(minutely), 1, 'the second spans its chart\'s 60 minutes');
+});
+
+test('a table in another card than a timestamp chart keeps the screen period', async () => {
+  const queries = [];
+  const env = createEnvironment({
+    'get_cards': JSON.stringify({
+      cards: [
+        { realtimeActivityCardData: { datas: [{ mainChartData: chartTable('HOUR', buckets(48, HOUR)) }] } },
+        { tableCardData: { mainTableData: videoTable(['vidC', 'vidD']) } }
+      ]
+    }),
+    'yta_web/join': recordingResponder(queries, { vidC: 2, vidD: 4 })
+  });
+  await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_cards?alt=json', fourWeekCardsRequest());
+
+  const videoQuery = videoQueryFor(queries, 'vidC');
+  assert.ok(videoQuery, 'the video table was queried');
+  assert.ok(videoQuery.timeRange.dateIdRange, 'over the screen\'s days, not the other card\'s hours');
+  assert.ok(!videoQuery.timeRange.unixTimeRange);
+});
+
+test('a table that shares no card with a timestamp chart keeps the screen period', async () => {
+  const queries = [];
+  const env = createEnvironment({
+    'get_cards': JSON.stringify({
+      results: {
+        chart: chartTable('HOUR', buckets(48, HOUR)),
+        table: videoTable(['vidC', 'vidD'])
+      }
+    }),
+    'yta_web/join': recordingResponder(queries, { vidC: 2, vidD: 4 })
+  });
+  await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_cards?alt=json', fourWeekCardsRequest());
+
+  const videoQuery = videoQueryFor(queries, 'vidC');
+  assert.ok(videoQuery, 'the video table was queried');
+  assert.ok(videoQuery.timeRange.dateIdRange, 'over the screen\'s days, not the chart\'s hours');
+  assert.ok(!videoQuery.timeRange.unixTimeRange);
+});
+
 test('an unrelated request is not touched', async () => {
   const env = createEnvironment({ 'creator/get_creator_channels': '{"channels":[]}' });
   const result = await request(env, 'https://studio.youtube.com/youtubei/v1/creator/get_creator_channels?alt=json', '{}');
