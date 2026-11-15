@@ -88,7 +88,9 @@ On the channel this was built against the difference is real: over 365 days the 
 - **Analytics** — the headline metric card, its comparison figure and daily chart, the sentence
   above the cards, and every table's view column. Channel, video and playlist scopes.
 - **Realtime** — the 48-hour card, including its hourly chart and its top-videos table, queried
-  over exactly the hours the card draws.
+  over exactly the hours the card draws. The card is recognised by its shape, a chart of time
+  buckets with a table beside it in the same card, not only by its name, and each table follows
+  the chart nearest to it, so two realtime charts on one screen keep their own windows.
 - **Channel dashboard** — the summary card and top content.
 - **Content tab** — the video list's lifetime view counts.
 - **Traffic sources, countries, devices, age against gender and the rest** — the tables that break
@@ -156,7 +158,8 @@ differently now" notices, which name the metric without reporting any figure.
 Because a card can arrive after the screen it belongs to, that verdict can be withdrawn: a later
 response that leaves figures raw puts Studio's own wording back.
 
-`relabel.js` corrects the wording on the analytics screens, the dashboard and the video list —
+`relabel.js` corrects the wording on the analytics screens (an address holding `/analytics` or
+`/insights`), the dashboard and the video list —
 and only once the interceptor confirms the numbers on that surface really changed.
 
 ## How it works
@@ -333,13 +336,27 @@ colour switch says, and the popup dims that switch to show it no longer applies.
 Studio draws its charts as inline SVG with the colour written into `stroke` and `fill`
 attributes, which a stylesheet rule outranks. `charts.css` recolours them by class and by
 attribute value, so it catches the line series, the area fill, the realtime bars and anything
-else painted in the default accent colour. Everything is scoped to an attribute the settings
+else painted in the default accent colour, whether that blue is written as `rgba()`, `rgb()` or
+hex, in an attribute or an inline style. Everything is scoped to an attribute the settings
 bridge writes, so turning the option off restores Studio's palette with no cleanup.
 
 ## Diagnosing a problem
 
 Turn on **Log to the console** in the popup; each converted response reports what it changed, and
 any fault reports why it gave up.
+
+The same switch reports what RealView does not recognise, which is the first thing to look at
+after a Studio update:
+
+- `cards: ...` names the cards a response carried. A name that is new is a card Studio has added
+  or renamed.
+- `left raw by an unfamiliar card: ...` names a card whose figures are reported in a shape that
+  is not converted.
+- `not handled: /youtubei/v1/...` names a Studio request that no converter reads, once per
+  address.
+- `requested with fetch, which RealView does not read: ...` names a Studio request made with
+  `fetch`. Only `XMLHttpRequest` is intercepted, so a screen that moves to `fetch` stays raw
+  until the interceptor is taught to read it. `fetch` is watched for this report, never patched.
 
 There is also a switch for narrowing a problem down to one surface. In the console on any Studio
 page:

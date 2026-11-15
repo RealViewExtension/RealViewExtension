@@ -1,5 +1,16 @@
 [
   {
+    "version": "1.8.5",
+    "date": "2026-11-15",
+    "changes": [
+      "The list of top videos beside a realtime chart is now counted over the same hours the chart draws, whatever name YouTube Studio gives that card. Before, a card Studio had renamed could show the list counted over the wrong period.",
+      "When a page carries two realtime charts, such as the last 48 hours and the last 60 minutes, each list of videos now matches its own chart.",
+      "The word \"Views\" is also corrected on pages with an Insights address, the new name YouTube is giving Analytics.",
+      "Charts turn red in more of the ways Studio can write its blue.",
+      "With \"Log to the console\" on, RealView now names any Studio card or request it does not recognise, so a change on YouTube's side is quicker to track down."
+    ]
+  },
+  {
     "version": "1.8.4",
     "date": "2026-10-06",
     "changes": [
